@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "zarrsum"
+version = "0.1.0"
+description = "A Zarr-aware content id (BLAKE3 Merkle tree) for versioning Zarr datasets."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Alan Liddell" }]
+dependencies = ["blake3>=1.0"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+zarrsum = "zarrsum.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/zarrsum"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
