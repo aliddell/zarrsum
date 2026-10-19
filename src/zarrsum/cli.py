@@ -32,16 +32,16 @@ def main(argv=None) -> int:
         print(json.dumps(out, indent=2))
         return 0
 
-    print(f"dataset_id {r['dataset_id']}")
+    print(f"dataset_id {r['dataset_id']}  ({r['format']})")
     print(
-        f"stores={r['n_stores']} arrays={r['n_arrays']} chunks={r['n_chunks']} "
+        f"stores={r['n_stores']} arrays={r['n_arrays']} files={r['n_files']} "
         f"nonzarr={r['n_nonzarr']} wall={wall}s"
     )
     for rel, i in r["stores"]:
         print(f"  store {rel}  {i}")
     if a.arrays:
         for rel, i, n in r["arrays"]:
-            print(f"  array {rel}  chunks={n}  {i}")
+            print(f"  array {rel}  files={n}  {i}")
     return 0
 
 

@@ -25,6 +25,10 @@ DROP_META_KEYS = {"dimension_separator", "chunk_key_encoding"}
 
 READ_BLOCK = 4 << 20  # 4 MiB
 
+# Id format version. It is part of the root hash, so a format change gives new ids and
+# is detectable. Bump it whenever the construction below changes.
+FORMAT = "zarrsum-id/1"
+
 
 # ---------- hashing primitives ----------
 def _h(tag: str, items: list[bytes]) -> bytes:
@@ -85,10 +89,13 @@ def _array_encoding(array_dir: str, names: set[str]) -> dict:
     return {"sep": meta.get("dimension_separator", "."), "prefix": "", "kind": "v2"}
 
 
-def _canon_chunk_key(rel: str, enc: dict):
-    """Return the canonical chunk key ('0.0.0') if ``rel`` (a path relative to the array
-    dir) is a chunk/shard file, else None. Coords are joined on disk by ``enc['sep']``:
-    '/' means nested directories; any other separator means one file name."""
+def _data_file_key(rel: str, enc: dict):
+    """Return the canonical key ('0.0.0') of a data file if ``rel`` (a path relative to
+    the array dir) is a chunk or shard file, else None. For an unsharded array one data
+    file is one chunk; for a sharded Zarr v3 array one data file is one shard (which holds
+    many inner chunks). Either way the file is a leaf: zarrsum hashes the file, it does not
+    look inside a shard. The on-disk coords are joined by ``enc['sep']``: '/' means nested
+    directories; any other separator means one file name."""
     if enc["sep"] == "/":
         parts = rel.split(os.sep)
     else:
@@ -126,24 +133,25 @@ def _array_meta_items(d: str, names: set[str]) -> list[bytes]:
 
 
 def _hash_array(d: str, enc: dict, acc) -> bytes:
-    """Hash one array directory. ``acc`` collects arrays and non-Zarr sidecars."""
+    """Hash one array directory. Each data file (a chunk, or a shard for sharded v3) is a
+    leaf. ``acc`` collects arrays and non-Zarr sidecars."""
     names = set(os.listdir(d))
-    chunks = []  # (canon_key, file_hash)
+    leaves = []  # (canon_file_key, file_hash)
     for dp, _dn, fn in os.walk(d):
         for f in fn:
             ap = os.path.join(dp, f)
             if f in META_NAMES and dp == d:
                 continue  # array metadata, hashed via _array_meta_items
             rel = os.path.relpath(ap, d)
-            key = _canon_chunk_key(rel, enc)
+            key = _data_file_key(rel, enc)
             if key is not None:
-                chunks.append((key, _hash_file(ap)))
+                leaves.append((key, _hash_file(ap)))
             else:
                 acc["nonzarr"].append((os.path.relpath(ap, acc["root"]), _hash_file(ap)))
-    chunks.sort()
-    chunk_ser = _h("chunks", [k.encode() + b"\0" + hv for k, hv in chunks])
-    aid = _h("array", _array_meta_items(d, names) + [chunk_ser])
-    acc["arrays"].append((os.path.relpath(d, acc["root"]), aid, len(chunks)))
+    leaves.sort()
+    leaf_ser = _h("files", [k.encode() + b"\0" + hv for k, hv in leaves])
+    aid = _h("array", _array_meta_items(d, names) + [leaf_ser])
+    acc["arrays"].append((os.path.relpath(d, acc["root"]), aid, len(leaves)))
     return aid
 
 
@@ -196,13 +204,14 @@ def hash_dataset(root: str) -> dict:
     acc["nonzarr"].sort()
     store_ser = _h("stores", [r.encode() + b"\0" + i for r, i in stores])
     nz_ser = _h("nonzarr", [r.encode() + b"\0" + h for r, h in acc["nonzarr"]])
-    dataset_id = _h("dataset", [store_ser, nz_ser])
+    dataset_id = _h("dataset", [FORMAT.encode(), store_ser, nz_ser])
     return {
+        "format": FORMAT,
         "dataset_id": dataset_id.hex(),
         "stores": [(r, i.hex()) for r, i in stores],
         "arrays": [(r, i.hex(), n) for r, i, n in sorted(acc["arrays"])],
         "n_stores": len(stores),
         "n_arrays": len(acc["arrays"]),
-        "n_chunks": sum(n for _, _, n in acc["arrays"]),
+        "n_files": sum(n for _, _, n in acc["arrays"]),
         "n_nonzarr": len(acc["nonzarr"]),
     }
