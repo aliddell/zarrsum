@@ -17,11 +17,13 @@ def main(argv=None) -> int:
     ap.add_argument("path", help="a Zarr store, or a directory of stores and other files")
     ap.add_argument("--arrays", action="store_true", help="also print per-array ids")
     ap.add_argument("--json", action="store_true", help="print the full result as JSON")
+    ap.add_argument("--workers", type=int, default=None,
+                    help="file-hashing threads (default: auto; 1 = serial)")
     ap.add_argument("--version", action="version", version=f"zarrsum {__version__}")
     a = ap.parse_args(argv)
 
     t0 = time.time()
-    r = hash_dataset(a.path)
+    r = hash_dataset(a.path, max_workers=a.workers)
     wall = round(time.time() - t0, 2)
 
     if a.json:

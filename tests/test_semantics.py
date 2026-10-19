@@ -117,9 +117,19 @@ def test_v3_key_encoding_independent():
                 == zarrsum.hash_dataset(s_v2enc)["dataset_id"])
 
 
+def test_worker_count_invariant():
+    cb = {f"{i}.{j}": bytes([i * 2 + j]) * 16 for i in range(2) for j in range(2)}
+    with tempfile.TemporaryDirectory() as base:
+        s = _build(os.path.join(base, "s"), "/", [2, 2], cb)
+        serial = zarrsum.hash_dataset(s, max_workers=1)["dataset_id"]
+        parallel = zarrsum.hash_dataset(s, max_workers=8)["dataset_id"]
+    assert serial == parallel, "the id must not depend on the worker count"
+
+
 if __name__ == "__main__":
     test_separator_independent_and_rechunk_sensitive()
     test_deterministic()
     test_v3_sharded_hashes_shard_files()
     test_v3_key_encoding_independent()
+    test_worker_count_invariant()
     print("PASS")

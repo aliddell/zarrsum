@@ -1,19 +1,26 @@
 """Core of the Zarr content id.
 
-The id is a BLAKE3 Merkle tree over the chunk/shard files on disk and the canonical
-Zarr metadata: chunk -> array -> group -> store, then a dataset id that combines the
-store ids with the non-Zarr files.
+The id is a BLAKE3 Merkle tree over the data files on disk and the canonical Zarr
+metadata: file -> array -> group -> store, then a dataset id that combines the store ids
+with the non-Zarr files. A leaf is one data file: one chunk for an unsharded array, one
+shard for a sharded Zarr v3 array (the shard is not opened).
 
-Chunk bytes are hashed exactly. Chunk keys and metadata are canonicalised, so a
+Data bytes are hashed exactly. File keys and metadata are canonicalised, so a
 ``dimension_separator`` or ``chunk_key_encoding`` change alone does not move the id, but a
-re-chunk or a re-compress does. The hasher never decodes a chunk.
+re-chunk, a re-shard, or a re-compress does. The hasher never decodes a chunk.
 
-See ``data-versioning/design/zarr-content-hash.md`` and the 2026-10-16 decisions.
+The work runs in two phases: a single walk discovers the tree and the file list, then the
+files are hashed (in parallel by default, because file I/O and BLAKE3 both release the GIL),
+then the tree is combined. The id does not depend on the worker count or the walk order.
+
+See ``data-versioning/design/zarr-content-hash.md`` and the 2026-10-16 / 2026-10-19
+decisions.
 """
 from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 from blake3 import blake3
 
@@ -54,6 +61,21 @@ def _hash_file(path: str) -> bytes:
     return h.digest()
 
 
+def _hash_many(paths: list[str], max_workers) -> dict[str, bytes]:
+    """Hash every path. Parallel by default; file I/O and BLAKE3 release the GIL, so
+    threads overlap NFS latency. The result is a path -> digest map; order does not matter
+    because the caller sorts before combining."""
+    if not paths:
+        return {}
+    if max_workers is None:
+        max_workers = min(32, (os.cpu_count() or 4) * 4)
+    if max_workers <= 1:
+        return {p: _hash_file(p) for p in paths}
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        digests = list(ex.map(_hash_file, paths))
+    return dict(zip(paths, digests))
+
+
 def _canon_json(path: str) -> bytes:
     """Canonical JSON bytes of a metadata file, with layout-naming keys dropped."""
     try:
@@ -68,7 +90,7 @@ def _canon_json(path: str) -> bytes:
 
 # ---------- chunk-key classification ----------
 def _array_encoding(array_dir: str, names: set[str]) -> dict:
-    """Return how chunk keys are encoded for this array: {sep, prefix, kind}."""
+    """Return how data-file keys are encoded for this array: {sep, prefix, kind}."""
     if "zarr.json" in names:  # v3
         try:
             with open(os.path.join(array_dir, "zarr.json")) as f:
@@ -99,19 +121,18 @@ def _data_file_key(rel: str, enc: dict):
     if enc["sep"] == "/":
         parts = rel.split(os.sep)
     else:
-        if os.sep in rel:  # a '.'-encoded chunk is one file, never nested
+        if os.sep in rel:  # a '.'-encoded file is one file, never nested
             return None
         parts = rel.split(enc["sep"])
     if enc["prefix"]:
         if not parts or parts[0] != enc["prefix"]:
             return None
         parts = parts[1:]
-    if not all(p.isdigit() for p in parts):  # all() of [] is True -> scalar chunk ""
+    if not all(p.isdigit() for p in parts):  # all() of [] is True -> scalar file ""
         return None
     return ".".join(parts)
 
 
-# ---------- node hashing ----------
 def _is_array(names: set[str], d: str) -> bool:
     if ".zarray" in names:
         return True
@@ -132,86 +153,112 @@ def _array_meta_items(d: str, names: set[str]) -> list[bytes]:
     return items
 
 
-def _hash_array(d: str, enc: dict, acc) -> bytes:
-    """Hash one array directory. Each data file (a chunk, or a shard for sharded v3) is a
-    leaf. ``acc`` collects arrays and non-Zarr sidecars."""
+# ---------- phase 1: discover the tree and the file list ----------
+def _discover_array(d: str, enc: dict, nonzarr: list[str]) -> dict:
     names = set(os.listdir(d))
-    leaves = []  # (canon_file_key, file_hash)
+    leaves = []  # (canon_file_key, abspath)
     for dp, _dn, fn in os.walk(d):
         for f in fn:
             ap = os.path.join(dp, f)
             if f in META_NAMES and dp == d:
                 continue  # array metadata, hashed via _array_meta_items
-            rel = os.path.relpath(ap, d)
-            key = _data_file_key(rel, enc)
+            key = _data_file_key(os.path.relpath(ap, d), enc)
             if key is not None:
-                leaves.append((key, _hash_file(ap)))
+                leaves.append((key, ap))
             else:
-                acc["nonzarr"].append((os.path.relpath(ap, acc["root"]), _hash_file(ap)))
-    leaves.sort()
-    leaf_ser = _h("files", [k.encode() + b"\0" + hv for k, hv in leaves])
-    aid = _h("array", _array_meta_items(d, names) + [leaf_ser])
-    acc["arrays"].append((os.path.relpath(d, acc["root"]), aid, len(leaves)))
-    return aid
+                nonzarr.append(ap)
+    return {"kind": "array", "abs": d, "meta": _array_meta_items(d, names), "leaves": leaves}
 
 
-def _hash_group(d: str, acc) -> bytes:
+def _discover_group(d: str, nonzarr: list[str]) -> dict:
     names = set(os.listdir(d))
     meta = []
     for m in (".zgroup", "zarr.json", ".zattrs"):
         if m in names:
             meta.append(m.encode() + b"=" + _canon_json(os.path.join(d, m)))
-    children = []  # (name, id)
+    children = []  # (name, node), in sorted-name order
     for name in sorted(names):
         p = os.path.join(d, name)
         if os.path.isdir(p):
             cnames = set(os.listdir(p))
             if _is_array(cnames, p):
-                children.append((name, _hash_array(p, _array_encoding(p, cnames), acc)))
+                children.append((name, _discover_array(p, _array_encoding(p, cnames), nonzarr)))
             else:
-                children.append((name, _hash_group(p, acc)))
+                children.append((name, _discover_group(p, nonzarr)))
         elif name not in META_NAMES:
-            acc["nonzarr"].append((os.path.relpath(p, acc["root"]), _hash_file(p)))
+            nonzarr.append(p)
+    return {"kind": "group", "meta": meta, "children": children}
+
+
+# ---------- phase 3: combine using the digest map ----------
+def _combine(node: dict, dig: dict, arrays: list, root: str) -> bytes:
+    if node["kind"] == "array":
+        leaves = sorted((k, dig[ap]) for k, ap in node["leaves"])
+        leaf_ser = _h("files", [k.encode() + b"\0" + hv for k, hv in leaves])
+        aid = _h("array", node["meta"] + [leaf_ser])
+        arrays.append((os.path.relpath(node["abs"], root), aid, len(leaves)))
+        return aid
+    children = [(name, _combine(child, dig, arrays, root)) for name, child in node["children"]]
     child_ser = _h("children", [n.encode() + b"\0" + cid for n, cid in children])
-    return _h("group", meta + [child_ser])
+    return _h("group", node["meta"] + [child_ser])
 
 
-def hash_dataset(root: str) -> dict:
+def hash_dataset(root: str, max_workers=None) -> dict:
     """Hash a dataset tree. ``root`` may be one Zarr store or a directory that holds many
-    stores and non-Zarr files. Returns the dataset id, per-store ids, and per-array ids.
-
-    The result keys are all JSON-safe (hex strings and ints)."""
-    acc = {"root": root, "arrays": [], "nonzarr": []}
-    stores = []  # (relpath, store_id)
+    stores and non-Zarr files. ``max_workers`` controls the file-hashing thread pool
+    (None = auto, 1 = serial). The id is independent of the worker count. Returns the
+    dataset id, per-store ids, and per-array ids; all values are JSON-safe."""
+    # Phase 1: one walk builds the tree and the file list, without reading bytes.
+    nonzarr = []  # abspaths
+    stores = []  # (relpath, node)
     for dp, dn, fn in os.walk(root):
         names = set(fn) | set(dn)
-        # The shallowest dir on a path that holds a Zarr marker is a store root. os.walk
-        # is top-down and we prune below, so nested group markers are not seen here. Do
-        # not rely on a ".zarr" suffix: it is only a convention.
+        # The shallowest dir on a path that holds a Zarr marker is a store root. os.walk is
+        # top-down and we prune below, so nested group markers are not seen here. Do not
+        # rely on a ".zarr" suffix: it is only a convention.
         if names & ZARR_MARKERS:
             cnames = set(os.listdir(dp))
             if _is_array(cnames, dp):
-                sid = _hash_array(dp, _array_encoding(dp, cnames), acc)
+                node = _discover_array(dp, _array_encoding(dp, cnames), nonzarr)
             else:
-                sid = _hash_group(dp, acc)
-            stores.append((os.path.relpath(dp, root), sid))
-            dn[:] = []  # hashed recursively; do not descend
+                node = _discover_group(dp, nonzarr)
+            stores.append((os.path.relpath(dp, root), node))
+            dn[:] = []
         else:
             for f in fn:
-                ap = os.path.join(dp, f)
-                acc["nonzarr"].append((os.path.relpath(ap, root), _hash_file(ap)))
-    stores.sort()
-    acc["nonzarr"].sort()
-    store_ser = _h("stores", [r.encode() + b"\0" + i for r, i in stores])
-    nz_ser = _h("nonzarr", [r.encode() + b"\0" + h for r, h in acc["nonzarr"]])
+                nonzarr.append(os.path.join(dp, f))
+
+    # Phase 2: hash every data file and non-Zarr file (parallel by default).
+    leaf_abs = []
+
+    def _collect(n):
+        if n["kind"] == "array":
+            leaf_abs.extend(ap for _k, ap in n["leaves"])
+        else:
+            for _name, c in n["children"]:
+                _collect(c)
+
+    for _rel, node in stores:
+        _collect(node)
+    dig = _hash_many(leaf_abs + nonzarr, max_workers)
+
+    # Phase 3: combine.
+    arrays = []
+    store_ids = []
+    for rel, node in stores:
+        store_ids.append((rel, _combine(node, dig, arrays, root)))
+    store_ids.sort()
+    nz = sorted((os.path.relpath(p, root), dig[p]) for p in nonzarr)
+    store_ser = _h("stores", [r.encode() + b"\0" + i for r, i in store_ids])
+    nz_ser = _h("nonzarr", [r.encode() + b"\0" + h for r, h in nz])
     dataset_id = _h("dataset", [FORMAT.encode(), store_ser, nz_ser])
     return {
         "format": FORMAT,
         "dataset_id": dataset_id.hex(),
-        "stores": [(r, i.hex()) for r, i in stores],
-        "arrays": [(r, i.hex(), n) for r, i, n in sorted(acc["arrays"])],
-        "n_stores": len(stores),
-        "n_arrays": len(acc["arrays"]),
-        "n_files": sum(n for _, _, n in acc["arrays"]),
-        "n_nonzarr": len(acc["nonzarr"]),
+        "stores": [(r, i.hex()) for r, i in store_ids],
+        "arrays": [(r, i.hex(), n) for r, i, n in sorted(arrays)],
+        "n_stores": len(store_ids),
+        "n_arrays": len(arrays),
+        "n_files": sum(n for _, _, n in arrays),
+        "n_nonzarr": len(nz),
     }
