@@ -7,20 +7,20 @@ shard for a sharded Zarr v3 array (the shard is not opened).
 
 Two leaf policies:
 
-- ``bytes`` (default): a data-file leaf is ``BLAKE3(file bytes)``. Always sound. Reads
-  every byte, so the first pass is read-bound.
+- ``bytes`` (default): a data-file leaf is ``BLAKE3(file bytes)``. Always sound; reads
+  every byte.
 - ``inventory``: a data-file leaf is ``BLAKE3(file size)`` -- a stat, no byte read. Near
-  free at PB scale. It is sound only where data files are never rewritten in place at the
-  same key and size; it cannot see such a rewrite. Metadata and non-Zarr files are always
-  hashed in full (they are small), so a metadata edit is always caught.
+  free at PB scale. Sound where data files are never rewritten in place at the same key and
+  size. Metadata and non-Zarr files are always hashed in full, so a metadata edit is caught.
 
-Either way, file keys and metadata are canonicalised, so a ``dimension_separator`` or
-``chunk_key_encoding`` change alone does not move the id, but a re-chunk, a re-shard, or a
-re-compress does (the metadata and the file inventory change). The policy is named in the
-id's format version, so a ``bytes`` id and an ``inventory`` id never look alike.
+Work runs in two phases. Discovery crawls the tree and lists files; it is parallel by
+default (a concurrent ``scandir`` BFS plus a concurrent metadata prefetch), because on a
+network filesystem the per-directory ``readdir`` latency, not the bytes, dominates. The
+combine phase is pure in-memory hashing. The id does not depend on the worker count or the
+walk order. A serial discovery path is kept for cross-checking.
 
-See ``data-versioning/design/zarr-content-hash.md`` and the 2026-10-16 / 2026-10-19
-decisions.
+See ``data-versioning/design/zarr-content-hash.md`` and the 2026-10-16 / 2026-10-19 /
+2026-10-20 decisions.
 """
 from __future__ import annotations
 
@@ -35,15 +35,15 @@ ZARR_MARKERS = {".zgroup", ".zarray", "zarr.json"}
 DROP_META_KEYS = {"dimension_separator", "chunk_key_encoding"}
 
 READ_BLOCK = 4 << 20  # 4 MiB
-
-# Id format version per leaf policy. It is part of the root hash, so the policy and any
-# construction change are detectable. Bump when the construction changes.
 FORMATS = {"bytes": "zarrsum-id/1", "inventory": "zarrsum-inv/1"}
+
+
+def _default_workers() -> int:
+    return min(32, (os.cpu_count() or 4) * 4)
 
 
 # ---------- hashing primitives ----------
 def _h(tag: str, items: list[bytes]) -> bytes:
-    """Typed, length-prefixed BLAKE3 over a list of byte items."""
     hasher = blake3()
     t = tag.encode()
     hasher.update(len(t).to_bytes(8, "little"))
@@ -70,27 +70,24 @@ def _size_leaf(path: str) -> bytes:
     return _h("size", [os.path.getsize(path).to_bytes(8, "little")])
 
 
-def _hash_many(paths: list[str], max_workers, mode: str) -> dict[str, bytes]:
-    """Map each path to a leaf digest. ``mode`` is 'bytes' (read and hash) or 'size' (stat).
-    Parallel by default; file I/O, stat latency, and BLAKE3 all release the GIL, so threads
-    overlap NFS latency. Order does not matter; the caller sorts before combining."""
-    if not paths:
-        return {}
+def _run(fn, items, workers):
+    if not items:
+        return []
+    if workers <= 1:
+        return [fn(x) for x in items]
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        return list(ex.map(fn, items))
+
+
+def _hash_many(paths: list[str], workers: int, mode: str) -> dict[str, bytes]:
     fn = _hash_file_bytes if mode == "bytes" else _size_leaf
-    if max_workers is None:
-        max_workers = min(32, (os.cpu_count() or 4) * 4)
-    if max_workers <= 1:
-        return {p: fn(p) for p in paths}
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        digests = list(ex.map(fn, paths))
-    return dict(zip(paths, digests))
+    return dict(zip(paths, _run(fn, paths, workers)))
 
 
-def _canon_json(path: str) -> bytes:
+def _canon_bytes(b: bytes) -> bytes:
     try:
-        with open(path, "rb") as f:
-            obj = json.load(f)
-    except (OSError, ValueError):
+        obj = json.loads(b)
+    except (ValueError, TypeError):
         return b""
     if isinstance(obj, dict):
         obj = {k: v for k, v in obj.items() if k not in DROP_META_KEYS}
@@ -98,23 +95,13 @@ def _canon_json(path: str) -> bytes:
 
 
 # ---------- chunk-key classification ----------
-def _array_encoding(array_dir: str, names: set[str]) -> dict:
-    if "zarr.json" in names:  # v3
-        try:
-            with open(os.path.join(array_dir, "zarr.json")) as f:
-                meta = json.load(f)
-        except (OSError, ValueError):
-            meta = {}
+def _encoding_from_meta(meta: dict, is_v3: bool) -> dict:
+    if is_v3:
         cke = meta.get("chunk_key_encoding") or {}
         name = cke.get("name", "default")
         default_sep = "/" if name == "default" else "."
         sep = (cke.get("configuration") or {}).get("separator", default_sep)
         return {"sep": sep, "prefix": "c" if name == "default" else "", "kind": "v3"}
-    try:
-        with open(os.path.join(array_dir, ".zarray")) as f:
-            meta = json.load(f)
-    except (OSError, ValueError):
-        meta = {}
     return {"sep": meta.get("dimension_separator", "."), "prefix": "", "kind": "v2"}
 
 
@@ -136,64 +123,144 @@ def _data_file_key(rel: str, enc: dict):
     return ".".join(parts)
 
 
-def _is_array(names: set[str], d: str) -> bool:
-    if ".zarray" in names:
-        return True
-    if "zarr.json" in names:
+# ---------- parallel discovery ----------
+def _scan_dir(d: str):
+    subdirs, files = [], []
+    try:
+        with os.scandir(d) as it:
+            for e in it:
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        subdirs.append(e.name)
+                    else:
+                        files.append(e.name)
+                except OSError:
+                    files.append(e.name)
+    except OSError:
+        pass
+    return d, subdirs, files
+
+
+def _crawl(root: str, workers: int) -> dict:
+    """Concurrent level-synchronous BFS. Returns {dir: (subdirs, files)} for every directory
+    reachable from root. All directories at one depth are listed at once."""
+    entries = {}
+    pending = [root]
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        while pending:
+            results = ex.map(_scan_dir, pending) if workers > 1 else map(_scan_dir, pending)
+            pending = []
+            for d, subs, files in results:
+                entries[d] = (subs, files)
+                pending.extend(os.path.join(d, s) for s in subs)
+    return entries
+
+
+def _prefetch_meta(entries: dict, workers: int) -> dict:
+    paths = [os.path.join(d, f) for d, (_s, files) in entries.items()
+             for f in files if f in META_NAMES]
+
+    def rd(p):
         try:
-            with open(os.path.join(d, "zarr.json")) as f:
-                return json.load(f).get("node_type") == "array"
-        except (OSError, ValueError):
+            with open(p, "rb") as fh:
+                return p, fh.read()
+        except OSError:
+            return p, b""
+
+    return dict(_run(rd, paths, workers))
+
+
+def _is_array_cached(d: str, files: list, cache: dict) -> bool:
+    if ".zarray" in files:
+        return True
+    if "zarr.json" in files:
+        try:
+            return json.loads(cache.get(os.path.join(d, "zarr.json"), b"") or b"{}").get("node_type") == "array"
+        except ValueError:
             return False
     return False
 
 
-def _array_meta_items(d: str, names: set[str]) -> list[bytes]:
+def _enc_cached(d: str, files: list, cache: dict) -> dict:
+    if "zarr.json" in files:
+        try:
+            meta = json.loads(cache.get(os.path.join(d, "zarr.json"), b"") or b"{}")
+        except ValueError:
+            meta = {}
+        return _encoding_from_meta(meta, is_v3=True)
+    try:
+        meta = json.loads(cache.get(os.path.join(d, ".zarray"), b"") or b"{}")
+    except ValueError:
+        meta = {}
+    return _encoding_from_meta(meta, is_v3=False)
+
+
+def _meta_items(d: str, files: list, cache: dict, order) -> list[bytes]:
     items = []
-    for m in (".zarray", "zarr.json", ".zattrs"):
-        if m in names:
-            items.append(m.encode() + b"=" + _canon_json(os.path.join(d, m)))
+    for m in order:
+        if m in files:
+            items.append(m.encode() + b"=" + _canon_bytes(cache.get(os.path.join(d, m), b"")))
     return items
 
 
-# ---------- phase 1: discover the tree and the file list ----------
-def _discover_array(d: str, enc: dict, nonzarr: list[str]) -> dict:
-    names = set(os.listdir(d))
-    leaves = []  # (canon_file_key, abspath)
-    for dp, _dn, fn in os.walk(d):
-        for f in fn:
-            ap = os.path.join(dp, f)
-            if f in META_NAMES and dp == d:
+def _build_array(d: str, enc: dict, entries: dict, cache: dict, nonzarr: list) -> dict:
+    leaves = []
+    stack = [d]
+    while stack:
+        cur = stack.pop()
+        subs, files = entries[cur]
+        for f in files:
+            ap = os.path.join(cur, f)
+            if f in META_NAMES and cur == d:
                 continue
             key = _data_file_key(os.path.relpath(ap, d), enc)
-            if key is not None:
-                leaves.append((key, ap))
-            else:
-                nonzarr.append(ap)
-    return {"kind": "array", "abs": d, "meta": _array_meta_items(d, names), "leaves": leaves}
+            (leaves.append((key, ap)) if key is not None else nonzarr.append(ap))
+        for s in subs:
+            stack.append(os.path.join(cur, s))
+    meta = _meta_items(d, entries[d][1], cache, (".zarray", "zarr.json", ".zattrs"))
+    return {"kind": "array", "abs": d, "meta": meta, "leaves": leaves}
 
 
-def _discover_group(d: str, nonzarr: list[str]) -> dict:
-    names = set(os.listdir(d))
-    meta = []
-    for m in (".zgroup", "zarr.json", ".zattrs"):
-        if m in names:
-            meta.append(m.encode() + b"=" + _canon_json(os.path.join(d, m)))
-    children = []  # (name, node), in sorted-name order
-    for name in sorted(names):
+def _build_group(d: str, entries: dict, cache: dict, nonzarr: list) -> dict:
+    subs, files = entries[d]
+    meta = _meta_items(d, files, cache, (".zgroup", "zarr.json", ".zattrs"))
+    children = []
+    for name in sorted(subs):
         p = os.path.join(d, name)
-        if os.path.isdir(p):
-            cnames = set(os.listdir(p))
-            if _is_array(cnames, p):
-                children.append((name, _discover_array(p, _array_encoding(p, cnames), nonzarr)))
-            else:
-                children.append((name, _discover_group(p, nonzarr)))
-        elif name not in META_NAMES:
-            nonzarr.append(p)
+        psubs, pfiles = entries[p]
+        if _is_array_cached(p, pfiles, cache):
+            children.append((name, _build_array(p, _enc_cached(p, pfiles, cache), entries, cache, nonzarr)))
+        else:
+            children.append((name, _build_group(p, entries, cache, nonzarr)))
+    for f in sorted(files):
+        if f not in META_NAMES:
+            nonzarr.append(os.path.join(d, f))
     return {"kind": "group", "abs": d, "meta": meta, "children": children}
 
 
-# ---------- phase 3: combine using the digest map ----------
+def _discover_parallel(root: str, workers: int):
+    entries = _crawl(root, workers)
+    cache = _prefetch_meta(entries, workers)
+    stores, nonzarr = [], []
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        subs, files = entries[d]
+        if set(files) & ZARR_MARKERS:
+            if _is_array_cached(d, files, cache):
+                node = _build_array(d, _enc_cached(d, files, cache), entries, cache, nonzarr)
+            else:
+                node = _build_group(d, entries, cache, nonzarr)
+            stores.append((os.path.relpath(d, root), node))
+        else:
+            for f in files:
+                nonzarr.append(os.path.join(d, f))
+            for s in subs:
+                stack.append(os.path.join(d, s))
+    return stores, nonzarr
+
+
+# ---------- phase 3: combine ----------
 def _combine(node: dict, dig: dict, arrays: list, groups: list, root: str) -> bytes:
     if node["kind"] == "array":
         leaves = sorted((k, dig[ap]) for k, ap in node["leaves"])
@@ -209,33 +276,14 @@ def _combine(node: dict, dig: dict, arrays: list, groups: list, root: str) -> by
 
 
 def hash_dataset(root: str, max_workers=None, policy: str = "bytes") -> dict:
-    """Hash a dataset tree. ``root`` may be one Zarr store or a directory of stores and
-    other files. ``policy`` is 'bytes' (default, always sound) or 'inventory' (data-file
-    leaf = size, no byte read; see the module docstring). ``max_workers`` sizes the file
-    thread pool (None = auto, 1 = serial); the id does not depend on it. Returns the dataset
-    id, per-store ids, per-group ids, and per-array ids; all values are JSON-safe."""
+    """Hash a dataset tree. ``policy`` is 'bytes' (default) or 'inventory'. ``max_workers``
+    sizes the discovery and hashing thread pools (None = auto, 1 = serial); the id does not
+    depend on it."""
     if policy not in FORMATS:
         raise ValueError(f"policy must be one of {sorted(FORMATS)}")
+    w = _default_workers() if max_workers is None else max(1, max_workers)
+    stores, nonzarr = _discover_parallel(root, w)
 
-    # Phase 1: one walk builds the tree and the file list, without reading bytes.
-    nonzarr = []  # abspaths
-    stores = []  # (relpath, node)
-    for dp, dn, fn in os.walk(root):
-        names = set(fn) | set(dn)
-        if names & ZARR_MARKERS:
-            cnames = set(os.listdir(dp))
-            if _is_array(cnames, dp):
-                node = _discover_array(dp, _array_encoding(dp, cnames), nonzarr)
-            else:
-                node = _discover_group(dp, nonzarr)
-            stores.append((os.path.relpath(dp, root), node))
-            dn[:] = []
-        else:
-            for f in fn:
-                nonzarr.append(os.path.join(dp, f))
-
-    # Phase 2: data-file leaves use the policy; metadata (in _combine) and non-Zarr files are
-    # always hashed in full, because they are small and may be edited in place.
     leaf_abs = []
 
     def _collect(n):
@@ -248,12 +296,10 @@ def hash_dataset(root: str, max_workers=None, policy: str = "bytes") -> dict:
     for _rel, node in stores:
         _collect(node)
     mode = "size" if policy == "inventory" else "bytes"
-    dig = _hash_many(leaf_abs, max_workers, mode)
-    dig.update(_hash_many(nonzarr, max_workers, "bytes"))
+    dig = _hash_many(leaf_abs, w, mode)
+    dig.update(_hash_many(nonzarr, w, "bytes"))
 
-    # Phase 3: combine.
-    arrays, groups = [], []
-    store_ids = []
+    arrays, groups, store_ids = [], [], []
     for rel, node in stores:
         store_ids.append((rel, _combine(node, dig, arrays, groups, root)))
     store_ids.sort()

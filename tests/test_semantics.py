@@ -167,6 +167,40 @@ def test_inventory_sees_size_change_and_metadata_edit():
     assert inv_meta != inv_sz, "inventory must see a metadata edit (metadata is hashed in full)"
 
 
+def _build_nested(base):
+    """A store with a subgroup, two arrays, and a non-Zarr sidecar."""
+    d = os.path.join(base, "nested")
+    for sub in ("g/a1", "g/a2"):
+        os.makedirs(os.path.join(d, sub))
+    json.dump({"zarr_format": 2}, open(os.path.join(d, ".zgroup"), "w"))
+    json.dump({"zarr_format": 2}, open(os.path.join(d, "g", ".zgroup"), "w"))
+    for a, val in (("a1", 1), ("a2", 2)):
+        ad = os.path.join(d, "g", a)
+        json.dump({"zarr_format": 2, "shape": [4, 4], "chunks": [2, 2], "dtype": "<i4",
+                   "fill_value": 0, "order": "C", "filters": None, "compressor": None,
+                   "dimension_separator": "/"}, open(os.path.join(ad, ".zarray"), "w"))
+        for i in range(2):
+            os.makedirs(os.path.join(ad, str(i)))
+            with open(os.path.join(ad, str(i), "0"), "wb") as f:
+                f.write(bytes([val]) * 32)
+    with open(os.path.join(d, "g", "a1", "notes.json"), "w") as f:
+        f.write('{"sidecar": true}')  # non-Zarr sidecar inside an array dir
+    return d
+
+
+def test_nested_store_worker_invariant():
+    """A nested store (subgroup, two arrays, a sidecar): the id must not depend on the
+    worker count (so the parallel crawl at 1 vs many workers agrees), for both policies."""
+    with tempfile.TemporaryDirectory() as base:
+        d = _build_nested(base)
+        for pol in ("bytes", "inventory"):
+            one = zarrsum.hash_dataset(d, policy=pol, max_workers=1)
+            many = zarrsum.hash_dataset(d, policy=pol, max_workers=8)
+            assert one["dataset_id"] == many["dataset_id"], (pol, one["dataset_id"], many["dataset_id"])
+        r = zarrsum.hash_dataset(d)
+        assert r["n_arrays"] == 2 and r["n_groups"] >= 2 and r["n_nonzarr"] == 1, r  # sidecar counted
+
+
 if __name__ == "__main__":
     test_separator_independent_and_rechunk_sensitive()
     test_deterministic()
@@ -177,4 +211,5 @@ if __name__ == "__main__":
     test_inventory_differs_from_bytes()
     test_inventory_blind_to_same_size_rewrite()
     test_inventory_sees_size_change_and_metadata_edit()
+    test_nested_store_worker_invariant()
     print("PASS")
