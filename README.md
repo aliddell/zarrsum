@@ -62,6 +62,31 @@ for relpath, array_id, n_files in r["arrays"]:
 `hash_dataset` returns a dict with `dataset_id`, `format`, `policy`, `stores`, `groups`,
 `arrays`, and counts. All values are JSON-safe.
 
+## Manifest and DVC
+
+A storage tool moves the bytes; zarrsum records and checks the identity. The manifest is a
+small JSON file (keep it in git) that pins each dataset by its zarrsum id.
+
+```
+zarrsum-manifest add manifest.json training_data /path/to/data --policy inventory
+zarrsum-manifest verify manifest.json training_data          # exit 0 if it matches its pin
+```
+
+A typical flow with DVC (which stores and transfers the data):
+
+```
+dvc add data                                             # DVC: one pointer in git + the bytes
+zarrsum-manifest add manifest.json training_data data    # pin the identity
+git add -A && git commit -m "track + pin" && dvc push    # bytes -> remote (S3, Reef, ...)
+# elsewhere: a fresh clone
+dvc pull                                                  # bytes <- remote
+zarrsum-manifest verify manifest.json training_data      # prove you got the exact dataset
+```
+
+The verify step is what the manifest adds over DVC alone: a portable, Zarr-aware check that
+the bytes you fetched are the exact dataset the manifest names. See `examples/dvc_demo.sh`
+for a runnable end-to-end demo (including a tamper check).
+
 ## Test
 
 ```

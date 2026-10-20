@@ -17,6 +17,7 @@ test = ["pytest>=8"]
 
 [project.scripts]
 zarrsum = "zarrsum.cli:main"
+zarrsum-manifest = "zarrsum.manifest:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/zarrsum"]
