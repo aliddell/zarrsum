@@ -215,6 +215,40 @@ def test_symlinks_are_skipped():
         assert r["dataset_id"] == base_id, "symlinks must not change the id (they are skipped)"
 
 
+def test_ignore_transient_stores():
+    with tempfile.TemporaryDirectory() as base:
+        ds = os.path.join(base, "ds")
+        _build(os.path.join(ds, "real.zarr"), "/", [2, 2], {"0.0": b"\x01" * 16})
+        only_real = zarrsum.hash_dataset(ds)["dataset_id"]
+        # a transient store that must be ignored by default
+        _build(os.path.join(ds, ".trash_seg.zarr_temp_seg_1"), "/", [2, 2], {"0.0": b"\x09" * 16})
+        assert zarrsum.hash_dataset(ds)["dataset_id"] == only_real, "default ignore must skip it"
+        assert zarrsum.hash_dataset(ds, ignore=())["n_stores"] == 2, "no-ignore sees both"
+
+
+def test_incremental_cache():
+    with tempfile.TemporaryDirectory() as base:
+        s = _build(os.path.join(base, "s"), ".", [2, 2], {"0.0": b"\x01" * 16})
+        cache = os.path.join(base, "cache.json")
+        id1 = zarrsum.hash_dataset(s, policy="bytes", cache=cache)["dataset_id"]
+        assert os.path.exists(cache)
+        assert zarrsum.hash_dataset(s, policy="bytes", cache=cache)["dataset_id"] == id1  # reuse
+        chunk = os.path.join(s, "a", "0.0")
+        with open(chunk, "wb") as f:
+            f.write(b"\x02" * 16)  # same size, new bytes, fresh mtime
+        id2 = zarrsum.hash_dataset(s, policy="bytes", cache=cache)["dataset_id"]
+        assert id2 != id1, "a changed file (new mtime) must change the id"
+        # stale-cache case: change bytes but restore the cached mtime, so (size, mtime) match
+        m = os.stat(chunk).st_mtime_ns  # this mtime is now in the cache (for the \x02 bytes)
+        with open(chunk, "wb") as f:
+            f.write(b"\x03" * 16)  # new bytes, same size
+        os.utime(chunk, ns=(m, m))  # restore mtime -> cache will trust and reuse
+        stale = zarrsum.hash_dataset(s, policy="bytes", cache=cache)["dataset_id"]
+        fresh = zarrsum.hash_dataset(s, policy="bytes", cache=cache, verify=True)["dataset_id"]
+        assert stale == id2, "cache trusts (size, mtime): same mtime -> reuses the old hash"
+        assert fresh != id2, "verify re-reads the bytes and sees the change"
+
+
 if __name__ == "__main__":
     test_separator_independent_and_rechunk_sensitive()
     test_deterministic()
@@ -227,4 +261,6 @@ if __name__ == "__main__":
     test_inventory_sees_size_change_and_metadata_edit()
     test_nested_store_worker_invariant()
     test_symlinks_are_skipped()
+    test_ignore_transient_stores()
+    test_incremental_cache()
     print("PASS")

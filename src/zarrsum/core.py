@@ -24,6 +24,7 @@ See ``data-versioning/design/zarr-content-hash.md`` and the 2026-10-16 / 2026-10
 """
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -36,6 +37,15 @@ DROP_META_KEYS = {"dimension_separator", "chunk_key_encoding"}
 
 READ_BLOCK = 4 << 20  # 4 MiB
 FORMATS = {"bytes": "zarrsum-id/1", "inventory": "zarrsum-inv/1"}
+
+# Directory names skipped during the crawl: transient pipeline stores that are not part of
+# the dataset (e.g. the OPS `.trash_..._temp_seg_...` stores). Matched with fnmatch on the
+# directory name. A skipped dir is excluded from the id entirely.
+DEFAULT_IGNORE = (".trash*", "*_temp", "*_temp_*", "*.tmp")
+
+
+def _ignored(name: str, patterns) -> bool:
+    return any(fnmatch.fnmatch(name, p) for p in patterns)
 
 
 class DatasetChangedError(RuntimeError):
@@ -93,6 +103,48 @@ def _run(fn, items, workers):
 def _hash_many(paths: list[str], workers: int, mode: str) -> dict[str, bytes]:
     fn = _hash_file_bytes if mode == "bytes" else _size_leaf
     return dict(zip(paths, _run(fn, paths, workers)))
+
+
+def _hash_bytes_cached(paths: list[str], root: str, workers: int, cache_path: str,
+                       verify: bool) -> dict[str, bytes]:
+    """Byte-policy hashing with a reuse cache keyed by (size, mtime_ns). A file whose size
+    and mtime match the cache reuses its stored hash instead of being re-read, so a new
+    version re-reads only the files that changed. ``verify`` ignores the old cache (re-reads
+    everything) but still refreshes it. mtime_ns is exact, so float rounding is not an
+    issue. The cache trusts mtime: a rewrite that keeps the same size and mtime is not seen
+    (use ``verify``)."""
+    old = {}
+    if not verify and os.path.exists(cache_path):
+        try:
+            with open(cache_path) as f:
+                old = json.load(f).get("files", {})
+        except (OSError, ValueError):
+            old = {}
+
+    def leaf(ap):
+        rel = os.path.relpath(ap, root)
+        try:
+            st = os.stat(ap)
+        except FileNotFoundError:
+            raise DatasetChangedError(f"{ap} disappeared during hashing; quiesce writes and retry")
+        e = old.get(rel)
+        if e and e[0] == st.st_size and e[1] == st.st_mtime_ns:
+            h = bytes.fromhex(e[2])
+        else:
+            h = _hash_file_bytes(ap)
+        return rel, st.st_size, st.st_mtime_ns, h
+
+    rows = _run(leaf, paths, workers)
+    dig = {}
+    new = {}
+    for ap, (rel, size, mtime_ns, h) in zip(paths, rows):
+        dig[ap] = h
+        new[rel] = [size, mtime_ns, h.hex()]
+    tmp = cache_path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"cache_version": 1, "files": new}, f)
+    os.replace(tmp, cache_path)
+    return dig
 
 
 def _canon_bytes(b: bytes) -> bytes:
@@ -157,9 +209,10 @@ def _scan_dir(d: str):
     return d, subdirs, files
 
 
-def _crawl(root: str, workers: int) -> dict:
+def _crawl(root: str, workers: int, ignore) -> dict:
     """Concurrent level-synchronous BFS. Returns {dir: (subdirs, files)} for every directory
-    reachable from root. All directories at one depth are listed at once."""
+    reachable from root, minus ignored directory names. All dirs at one depth are listed at
+    once."""
     entries = {}
     pending = [root]
     with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
@@ -167,6 +220,7 @@ def _crawl(root: str, workers: int) -> dict:
             results = ex.map(_scan_dir, pending) if workers > 1 else map(_scan_dir, pending)
             pending = []
             for d, subs, files in results:
+                subs = [s for s in subs if not _ignored(s, ignore)]
                 entries[d] = (subs, files)
                 pending.extend(os.path.join(d, s) for s in subs)
     return entries
@@ -254,8 +308,8 @@ def _build_group(d: str, entries: dict, cache: dict, nonzarr: list) -> dict:
     return {"kind": "group", "abs": d, "meta": meta, "children": children}
 
 
-def _discover_parallel(root: str, workers: int):
-    entries = _crawl(root, workers)
+def _discover_parallel(root: str, workers: int, ignore):
+    entries = _crawl(root, workers, ignore)
     cache = _prefetch_meta(entries, workers)
     stores, nonzarr = [], []
     stack = [root]
@@ -291,14 +345,18 @@ def _combine(node: dict, dig: dict, arrays: list, groups: list, root: str) -> by
     return gid
 
 
-def hash_dataset(root: str, max_workers=None, policy: str = "bytes") -> dict:
+def hash_dataset(root: str, max_workers=None, policy: str = "bytes", ignore=None,
+                 cache=None, verify=False) -> dict:
     """Hash a dataset tree. ``policy`` is 'bytes' (default) or 'inventory'. ``max_workers``
-    sizes the discovery and hashing thread pools (None = auto, 1 = serial); the id does not
-    depend on it."""
+    sizes the thread pools (None = auto, 1 = serial); the id does not depend on it.
+    ``ignore`` is a list of fnmatch patterns for directory names to skip (default:
+    DEFAULT_IGNORE). ``cache`` is a path to a reuse cache (bytes policy only) so a new version
+    re-reads only changed files; ``verify`` ignores the old cache but refreshes it."""
     if policy not in FORMATS:
         raise ValueError(f"policy must be one of {sorted(FORMATS)}")
     w = _default_workers() if max_workers is None else max(1, max_workers)
-    stores, nonzarr = _discover_parallel(root, w)
+    ign = DEFAULT_IGNORE if ignore is None else tuple(ignore)
+    stores, nonzarr = _discover_parallel(root, w, ign)
 
     leaf_abs = []
 
@@ -311,8 +369,11 @@ def hash_dataset(root: str, max_workers=None, policy: str = "bytes") -> dict:
 
     for _rel, node in stores:
         _collect(node)
-    mode = "size" if policy == "inventory" else "bytes"
-    dig = _hash_many(leaf_abs, w, mode)
+    if policy == "bytes" and cache:
+        dig = _hash_bytes_cached(leaf_abs, root, w, cache, verify)
+    else:
+        mode = "size" if policy == "inventory" else "bytes"
+        dig = _hash_many(leaf_abs, w, mode)
     dig.update(_hash_many(nonzarr, w, "bytes"))
 
     arrays, groups, store_ids = [], [], []

@@ -24,12 +24,19 @@ def main(argv=None) -> int:
     ap.add_argument("--json", action="store_true", help="print the full result as JSON")
     ap.add_argument("--workers", type=int, default=None,
                     help="file-hashing threads (default: auto; 1 = serial)")
+    ap.add_argument("--ignore", action="append", default=None, metavar="GLOB",
+                    help="directory-name glob to skip (repeatable; replaces the default set)")
+    ap.add_argument("--cache", default=None, metavar="PATH",
+                    help="reuse cache (bytes policy): re-read only changed files")
+    ap.add_argument("--verify", action="store_true",
+                    help="ignore the reuse cache (re-read everything) but refresh it")
     ap.add_argument("--version", action="version", version=f"zarrsum {__version__}")
     a = ap.parse_args(argv)
 
     t0 = time.time()
     try:
-        r = hash_dataset(a.path, max_workers=a.workers, policy=a.policy)
+        r = hash_dataset(a.path, max_workers=a.workers, policy=a.policy,
+                         ignore=a.ignore, cache=a.cache, verify=a.verify)
     except DatasetChangedError as e:
         print(f"zarrsum: {e}", file=sys.stderr)
         return 2
