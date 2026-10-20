@@ -11,8 +11,13 @@ changed, and the manifest can pin a whole store or a subset of its arrays.
 
 - A **BLAKE3 Merkle tree**: chunk -> array -> group -> store, then a dataset id that
   combines the store ids with the non-Zarr files.
-- **Byte-exact** on chunk bytes. The hasher never decodes a chunk. A re-chunk or a
-  re-compress changes the id; a separator or key-encoding change alone does not.
+- **Two leaf policies.** `bytes` (default) hashes every data-file's bytes — always sound,
+  but it reads everything. `inventory` hashes a data-file's **size only** (a stat, no byte
+  read) — near-free at PB scale, but sound only where data files are never rewritten in
+  place at the same key and size (it cannot see such a rewrite). Metadata and non-Zarr files
+  are always hashed in full under both policies, so a metadata edit is always caught. The
+  policy is named in the id's format version (`zarrsum-id/1` vs `zarrsum-inv/1`), so the two
+  never look alike.
 - **Zarr-aware**: it reads the key encoding from the array metadata, so it handles Zarr v2
   and the Zarr v3 `c/0/0/0` default. The leaf of the tree is a **data file**: for an
   unsharded array that is one chunk; for a sharded Zarr v3 array that is one shard (which
@@ -20,6 +25,9 @@ changed, and the manifest can pin a whole store or a subset of its arrays.
   inner-chunk layout is still captured, because it lives in the array metadata, which is
   hashed. Non-Zarr files (for example sidecar JSON) are hashed on their own and combined at
   the end.
+- Under either policy, a re-chunk, a re-shard, or a re-compress changes the id (the metadata
+  and the file inventory change); a `dimension_separator` or `chunk_key_encoding` change
+  alone does not.
 
 ## Install
 
@@ -34,23 +42,25 @@ The only runtime dependency is `blake3`. Python 3.10 or newer.
 Command line:
 
 ```
-zarrsum /path/to/store.zarr              # dataset id + per-store ids
-zarrsum /path/to/dataset_dir --arrays    # also per-array ids (for subset pins)
-zarrsum /path/to/store.zarr --json       # full result as JSON
+zarrsum /path/to/store.zarr                    # dataset id + per-store ids (bytes policy)
+zarrsum /path/to/store.zarr --policy inventory # size-only id, no byte reads
+zarrsum /path/to/dataset_dir --arrays --groups # also per-array and per-group ids (subset pins)
+zarrsum /path/to/store.zarr --json             # full result as JSON
+zarrsum /path/to/store.zarr --workers 1        # serial (default: auto-parallel)
 ```
 
 Library:
 
 ```python
 import zarrsum
-r = zarrsum.hash_dataset("/path/to/store.zarr")
+r = zarrsum.hash_dataset("/path/to/store.zarr", policy="inventory")
 print(r["dataset_id"])
 for relpath, array_id, n_files in r["arrays"]:
     print(relpath, array_id, n_files)
 ```
 
-`hash_dataset` returns a dict with `dataset_id`, `stores`, `arrays`, and counts. All
-values are JSON-safe.
+`hash_dataset` returns a dict with `dataset_id`, `format`, `policy`, `stores`, `groups`,
+`arrays`, and counts. All values are JSON-safe.
 
 ## Test
 

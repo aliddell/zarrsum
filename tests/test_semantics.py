@@ -126,10 +126,55 @@ def test_worker_count_invariant():
     assert serial == parallel, "the id must not depend on the worker count"
 
 
+def test_group_ids_present():
+    with tempfile.TemporaryDirectory() as base:
+        s = _build(os.path.join(base, "s"), "/", [2, 2], {"0.0": b"\x01" * 16})
+        r = zarrsum.hash_dataset(s)
+    assert r["n_groups"] >= 1 and r["groups"], r
+
+
+def test_inventory_differs_from_bytes():
+    with tempfile.TemporaryDirectory() as base:
+        s = _build(os.path.join(base, "s"), ".", [2, 2], {"0.0": b"\x01" * 16})
+        assert (zarrsum.hash_dataset(s, policy="bytes")["dataset_id"]
+                != zarrsum.hash_dataset(s, policy="inventory")["dataset_id"])
+
+
+def test_inventory_blind_to_same_size_rewrite():
+    with tempfile.TemporaryDirectory() as base:
+        s = _build(os.path.join(base, "s"), ".", [2, 2], {"0.0": b"\x01" * 16})
+        inv1 = zarrsum.hash_dataset(s, policy="inventory")["dataset_id"]
+        byt1 = zarrsum.hash_dataset(s, policy="bytes")["dataset_id"]
+        with open(os.path.join(s, "a", "0.0"), "wb") as f:  # same size (16), new bytes
+            f.write(b"\x02" * 16)
+        inv2 = zarrsum.hash_dataset(s, policy="inventory")["dataset_id"]
+        byt2 = zarrsum.hash_dataset(s, policy="bytes")["dataset_id"]
+    assert inv1 == inv2, "inventory is, by design, blind to a same-size in-place rewrite"
+    assert byt1 != byt2, "bytes policy must catch the rewrite"
+
+
+def test_inventory_sees_size_change_and_metadata_edit():
+    with tempfile.TemporaryDirectory() as base:
+        s = _build(os.path.join(base, "s"), ".", [2, 2], {"0.0": b"\x01" * 16})
+        inv0 = zarrsum.hash_dataset(s, policy="inventory")["dataset_id"]
+        with open(os.path.join(s, "a", "0.0"), "wb") as f:  # different size
+            f.write(b"\x01" * 32)
+        inv_sz = zarrsum.hash_dataset(s, policy="inventory")["dataset_id"]
+        za = os.path.join(s, "a", ".zarray")
+        meta = json.load(open(za)); meta["fill_value"] = 7; json.dump(meta, open(za, "w"))
+        inv_meta = zarrsum.hash_dataset(s, policy="inventory")["dataset_id"]
+    assert inv_sz != inv0, "inventory must see a data-file size change"
+    assert inv_meta != inv_sz, "inventory must see a metadata edit (metadata is hashed in full)"
+
+
 if __name__ == "__main__":
     test_separator_independent_and_rechunk_sensitive()
     test_deterministic()
     test_v3_sharded_hashes_shard_files()
     test_v3_key_encoding_independent()
     test_worker_count_invariant()
+    test_group_ids_present()
+    test_inventory_differs_from_bytes()
+    test_inventory_blind_to_same_size_rewrite()
+    test_inventory_sees_size_change_and_metadata_edit()
     print("PASS")

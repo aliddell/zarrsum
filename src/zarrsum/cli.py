@@ -15,7 +15,11 @@ def main(argv=None) -> int:
         description="Compute a Zarr-aware content id (BLAKE3 Merkle tree).",
     )
     ap.add_argument("path", help="a Zarr store, or a directory of stores and other files")
+    ap.add_argument("--policy", choices=["bytes", "inventory"], default="bytes",
+                    help="leaf policy: bytes (default, read every byte) or inventory "
+                         "(data-file size only, no byte read)")
     ap.add_argument("--arrays", action="store_true", help="also print per-array ids")
+    ap.add_argument("--groups", action="store_true", help="also print per-group ids")
     ap.add_argument("--json", action="store_true", help="print the full result as JSON")
     ap.add_argument("--workers", type=int, default=None,
                     help="file-hashing threads (default: auto; 1 = serial)")
@@ -23,7 +27,7 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
 
     t0 = time.time()
-    r = hash_dataset(a.path, max_workers=a.workers)
+    r = hash_dataset(a.path, max_workers=a.workers, policy=a.policy)
     wall = round(time.time() - t0, 2)
 
     if a.json:
@@ -31,16 +35,21 @@ def main(argv=None) -> int:
         out["wall_s"] = wall
         if not a.arrays:
             out.pop("arrays", None)
+        if not a.groups:
+            out.pop("groups", None)
         print(json.dumps(out, indent=2))
         return 0
 
     print(f"dataset_id {r['dataset_id']}  ({r['format']})")
     print(
-        f"stores={r['n_stores']} arrays={r['n_arrays']} files={r['n_files']} "
-        f"nonzarr={r['n_nonzarr']} wall={wall}s"
+        f"stores={r['n_stores']} groups={r['n_groups']} arrays={r['n_arrays']} "
+        f"files={r['n_files']} nonzarr={r['n_nonzarr']} wall={wall}s"
     )
     for rel, i in r["stores"]:
         print(f"  store {rel}  {i}")
+    if a.groups:
+        for rel, i in r["groups"]:
+            print(f"  group {rel}  {i}")
     if a.arrays:
         for rel, i, n in r["arrays"]:
             print(f"  array {rel}  files={n}  {i}")
