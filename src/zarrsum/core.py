@@ -38,6 +38,11 @@ READ_BLOCK = 4 << 20  # 4 MiB
 FORMATS = {"bytes": "zarrsum-id/1", "inventory": "zarrsum-inv/1"}
 
 
+class DatasetChangedError(RuntimeError):
+    """A file seen during discovery was gone when we hashed it. The dataset is being
+    written. A content id of a moving target is not well defined: quiesce writes and retry."""
+
+
 def _default_workers() -> int:
     return min(32, (os.cpu_count() or 4) * 4)
 
@@ -55,19 +60,25 @@ def _h(tag: str, items: list[bytes]) -> bytes:
 
 
 def _hash_file_bytes(path: str) -> bytes:
-    h = blake3(max_threads=blake3.AUTO)
-    with open(path, "rb") as f:
-        while True:
-            b = f.read(READ_BLOCK)
-            if not b:
-                break
-            h.update(b)
-    return h.digest()
+    try:
+        h = blake3(max_threads=blake3.AUTO)
+        with open(path, "rb") as f:
+            while True:
+                b = f.read(READ_BLOCK)
+                if not b:
+                    break
+                h.update(b)
+        return h.digest()
+    except FileNotFoundError:
+        raise DatasetChangedError(f"{path} disappeared during hashing; quiesce writes and retry")
 
 
 def _size_leaf(path: str) -> bytes:
     """An inventory leaf: hash the file size only (a stat, no byte read)."""
-    return _h("size", [os.path.getsize(path).to_bytes(8, "little")])
+    try:
+        return _h("size", [os.path.getsize(path).to_bytes(8, "little")])
+    except FileNotFoundError:
+        raise DatasetChangedError(f"{path} disappeared during hashing; quiesce writes and retry")
 
 
 def _run(fn, items, workers):
@@ -125,17 +136,22 @@ def _data_file_key(rel: str, enc: dict):
 
 # ---------- parallel discovery ----------
 def _scan_dir(d: str):
+    """List one directory. Symlinks are not followed: a symlink (to a file or a dir) is
+    skipped entirely, which avoids cycles, aliasing, and opening a symlinked dir as a file.
+    So the id covers the real files in the tree, not symlink targets."""
     subdirs, files = [], []
     try:
         with os.scandir(d) as it:
             for e in it:
                 try:
+                    if e.is_symlink():
+                        continue
                     if e.is_dir(follow_symlinks=False):
                         subdirs.append(e.name)
                     else:
                         files.append(e.name)
                 except OSError:
-                    files.append(e.name)
+                    continue
     except OSError:
         pass
     return d, subdirs, files

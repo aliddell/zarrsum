@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 
-from .core import hash_dataset
+from .core import hash_dataset, DatasetChangedError
 from . import __version__
 
 
@@ -27,7 +28,11 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
 
     t0 = time.time()
-    r = hash_dataset(a.path, max_workers=a.workers, policy=a.policy)
+    try:
+        r = hash_dataset(a.path, max_workers=a.workers, policy=a.policy)
+    except DatasetChangedError as e:
+        print(f"zarrsum: {e}", file=sys.stderr)
+        return 2
     wall = round(time.time() - t0, 2)
 
     if a.json:

@@ -201,6 +201,20 @@ def test_nested_store_worker_invariant():
         assert r["n_arrays"] == 2 and r["n_groups"] >= 2 and r["n_nonzarr"] == 1, r  # sidecar counted
 
 
+def test_symlinks_are_skipped():
+    with tempfile.TemporaryDirectory() as base:
+        s = _build(os.path.join(base, "s"), "/", [2, 2], {"0.0": b"\x01" * 16})
+        base_id = zarrsum.hash_dataset(s)["dataset_id"]
+        # a symlink to an external dir and a symlink to an external file, inside the store
+        ext_dir = os.path.join(base, "extdir"); os.makedirs(ext_dir)
+        with open(os.path.join(base, "extfile"), "wb") as f:
+            f.write(b"x" * 10)
+        os.symlink(ext_dir, os.path.join(s, "link_to_dir"))     # would crash if opened as a file
+        os.symlink(os.path.join(base, "extfile"), os.path.join(s, "a", "link_to_file"))
+        r = zarrsum.hash_dataset(s)  # must not raise
+        assert r["dataset_id"] == base_id, "symlinks must not change the id (they are skipped)"
+
+
 if __name__ == "__main__":
     test_separator_independent_and_rechunk_sensitive()
     test_deterministic()
@@ -212,4 +226,5 @@ if __name__ == "__main__":
     test_inventory_blind_to_same_size_rewrite()
     test_inventory_sees_size_change_and_metadata_edit()
     test_nested_store_worker_invariant()
+    test_symlinks_are_skipped()
     print("PASS")
