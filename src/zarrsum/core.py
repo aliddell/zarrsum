@@ -9,9 +9,11 @@ Two leaf policies:
 
 - ``bytes`` (default): a data-file leaf is ``BLAKE3(file bytes)``. Always sound; reads
   every byte.
-- ``inventory``: a data-file leaf is ``BLAKE3(file size)`` -- a stat, no byte read. Near
-  free at PB scale. Sound where data files are never rewritten in place at the same key and
-  size. Metadata and non-Zarr files are always hashed in full, so a metadata edit is caught.
+- ``inventory``: a data-file leaf is ``BLAKE3(size, mtime_ns)`` -- a stat, no byte read. Near
+  free at PB scale. An in-place rewrite bumps the mtime, so it is seen; the id is blind only
+  to a rewrite that keeps both the size and the mtime (which needs the mtime deliberately
+  preserved). Metadata and non-Zarr files are always hashed in full, so a metadata edit is
+  caught.
 
 Work runs in two phases. Discovery crawls the tree and lists files; it is parallel by
 default (a concurrent ``scandir`` BFS plus a concurrent metadata prefetch), because on a
@@ -36,7 +38,7 @@ ZARR_MARKERS = {".zgroup", ".zarray", "zarr.json"}
 DROP_META_KEYS = {"dimension_separator", "chunk_key_encoding"}
 
 READ_BLOCK = 4 << 20  # 4 MiB
-FORMATS = {"bytes": "zarrsum-id/1", "inventory": "zarrsum-inv/1"}
+FORMATS = {"bytes": "zarrsum-id/1", "inventory": "zarrsum-inv/2"}
 
 # Directory names skipped during the crawl: transient pipeline stores that are not part of
 # the dataset (e.g. the OPS `.trash_..._temp_seg_...` stores). Matched with fnmatch on the
@@ -83,12 +85,17 @@ def _hash_file_bytes(path: str) -> bytes:
         raise DatasetChangedError(f"{path} disappeared during hashing; quiesce writes and retry")
 
 
-def _size_leaf(path: str) -> bytes:
-    """An inventory leaf: hash the file size only (a stat, no byte read)."""
+def _inventory_leaf(path: str) -> bytes:
+    """An inventory leaf: hash (size, mtime_ns) -- a stat, no byte read. mtime is included so
+    an in-place rewrite that keeps the same size is still seen (its mtime bumps). The id is
+    then blind only to a rewrite that keeps both the size and the mtime, which needs the mtime
+    deliberately preserved (decision 2026-10-20)."""
     try:
-        return _h("size", [os.path.getsize(path).to_bytes(8, "little")])
+        st = os.stat(path)
     except FileNotFoundError:
         raise DatasetChangedError(f"{path} disappeared during hashing; quiesce writes and retry")
+    return _h("size+mtime", [st.st_size.to_bytes(8, "little"),
+                             st.st_mtime_ns.to_bytes(8, "little")])
 
 
 def _run(fn, items, workers):
@@ -101,7 +108,7 @@ def _run(fn, items, workers):
 
 
 def _hash_many(paths: list[str], workers: int, mode: str) -> dict[str, bytes]:
-    fn = _hash_file_bytes if mode == "bytes" else _size_leaf
+    fn = _hash_file_bytes if mode == "bytes" else _inventory_leaf
     return dict(zip(paths, _run(fn, paths, workers)))
 
 

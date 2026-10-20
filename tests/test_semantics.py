@@ -140,17 +140,22 @@ def test_inventory_differs_from_bytes():
                 != zarrsum.hash_dataset(s, policy="inventory")["dataset_id"])
 
 
-def test_inventory_blind_to_same_size_rewrite():
+def test_inventory_sees_same_size_rewrite_via_mtime():
     with tempfile.TemporaryDirectory() as base:
         s = _build(os.path.join(base, "s"), ".", [2, 2], {"0.0": b"\x01" * 16})
+        chunk = os.path.join(s, "a", "0.0")
         inv1 = zarrsum.hash_dataset(s, policy="inventory")["dataset_id"]
-        byt1 = zarrsum.hash_dataset(s, policy="bytes")["dataset_id"]
-        with open(os.path.join(s, "a", "0.0"), "wb") as f:  # same size (16), new bytes
+        m1 = os.stat(chunk).st_mtime_ns
+        with open(chunk, "wb") as f:  # same size (16), new bytes -> mtime bumps
             f.write(b"\x02" * 16)
         inv2 = zarrsum.hash_dataset(s, policy="inventory")["dataset_id"]
-        byt2 = zarrsum.hash_dataset(s, policy="bytes")["dataset_id"]
-    assert inv1 == inv2, "inventory is, by design, blind to a same-size in-place rewrite"
-    assert byt1 != byt2, "bytes policy must catch the rewrite"
+        assert inv2 != inv1, "inventory must see a same-size rewrite (mtime bumped)"
+        # the remaining blind spot: new bytes, same size, mtime restored to inv1's value
+        with open(chunk, "wb") as f:
+            f.write(b"\x03" * 16)
+        os.utime(chunk, ns=(m1, m1))
+        inv_blind = zarrsum.hash_dataset(s, policy="inventory")["dataset_id"]
+        assert inv_blind == inv1, "same size + restored mtime -> inventory id back to inv1 (blind)"
 
 
 def test_inventory_sees_size_change_and_metadata_edit():
@@ -257,7 +262,7 @@ if __name__ == "__main__":
     test_worker_count_invariant()
     test_group_ids_present()
     test_inventory_differs_from_bytes()
-    test_inventory_blind_to_same_size_rewrite()
+    test_inventory_sees_same_size_rewrite_via_mtime()
     test_inventory_sees_size_change_and_metadata_edit()
     test_nested_store_worker_invariant()
     test_symlinks_are_skipped()

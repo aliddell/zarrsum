@@ -39,21 +39,21 @@ def test_verify_detects_change():
         assert not manifest.verify_dataset(mpath, "ds")["ok"]  # bytes policy catches it
 
 
-def test_inventory_verify_blind_to_same_size():
+def test_inventory_verify_sees_same_size_rewrite():
     with tempfile.TemporaryDirectory() as base:
         s = _store(os.path.join(base, "s"), {"0.0": b"\x01" * 16})
         mpath = os.path.join(base, "manifest.json")
         manifest.add_dataset(mpath, "ds", s, policy="inventory")
         with open(os.path.join(s, "a", "0.0"), "wb") as f:
-            f.write(b"\x02" * 16)  # same size
-        assert manifest.verify_dataset(mpath, "ds")["ok"]  # inventory is blind (by design)
+            f.write(b"\x02" * 16)  # same size, new bytes -> mtime bumps
+        assert not manifest.verify_dataset(mpath, "ds")["ok"]  # inventory catches it via mtime
         with open(os.path.join(s, "a", "0.0"), "wb") as f:
             f.write(b"\x02" * 32)  # different size
-        assert not manifest.verify_dataset(mpath, "ds")["ok"]  # size change is caught
+        assert not manifest.verify_dataset(mpath, "ds")["ok"]  # size change is caught too
 
 
 if __name__ == "__main__":
     test_add_then_verify_ok()
     test_verify_detects_change()
-    test_inventory_verify_blind_to_same_size()
+    test_inventory_verify_sees_same_size_rewrite()
     print("PASS")

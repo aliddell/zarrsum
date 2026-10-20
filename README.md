@@ -12,12 +12,13 @@ changed, and the manifest can pin a whole store or a subset of its arrays.
 - A **BLAKE3 Merkle tree**: chunk -> array -> group -> store, then a dataset id that
   combines the store ids with the non-Zarr files.
 - **Two leaf policies.** `bytes` (default) hashes every data-file's bytes — always sound,
-  but it reads everything. `inventory` hashes a data-file's **size only** (a stat, no byte
-  read) — near-free at PB scale, but sound only where data files are never rewritten in
-  place at the same key and size (it cannot see such a rewrite). Metadata and non-Zarr files
-  are always hashed in full under both policies, so a metadata edit is always caught. The
-  policy is named in the id's format version (`zarrsum-id/1` vs `zarrsum-inv/1`), so the two
-  never look alike.
+  but it reads everything. `inventory` hashes a data-file's **`(size, mtime)`** (a stat, no
+  byte read) — near-free at PB scale. An in-place rewrite bumps the mtime, so it is seen; the
+  id is blind only to a rewrite that keeps *both* the size and the mtime (which needs the
+  mtime deliberately preserved). Metadata and non-Zarr files are always hashed in full under
+  both policies, so a metadata edit is always caught. The policy is named in the id's format
+  version (`zarrsum-id/1` vs `zarrsum-inv/2`), so the two never look alike. For transfer or
+  corruption QC (bit-rot keeps the same size and mtime), use the `bytes` policy.
 - **Zarr-aware**: it reads the key encoding from the array metadata, so it handles Zarr v2
   and the Zarr v3 `c/0/0/0` default. The leaf of the tree is a **data file**: for an
   unsharded array that is one chunk; for a sharded Zarr v3 array that is one shard (which
