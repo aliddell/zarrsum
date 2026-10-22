@@ -18,7 +18,7 @@ def main(argv=None) -> int:
     ap.add_argument("path", help="a Zarr store, or a directory of stores and other files")
     ap.add_argument("--policy", choices=["bytes", "inventory"], default="bytes",
                     help="leaf policy: bytes (default, read every byte) or inventory "
-                         "(data-file size only, no byte read)")
+                         "((size, mtime) of each data file, no byte read)")
     ap.add_argument("--arrays", action="store_true", help="also print per-array ids")
     ap.add_argument("--groups", action="store_true", help="also print per-group ids")
     ap.add_argument("--json", action="store_true", help="print the full result as JSON")

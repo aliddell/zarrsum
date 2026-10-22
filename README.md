@@ -44,7 +44,7 @@ Command line:
 
 ```
 zarrsum /path/to/store.zarr                    # dataset id + per-store ids (bytes policy)
-zarrsum /path/to/store.zarr --policy inventory # size-only id, no byte reads
+zarrsum /path/to/store.zarr --policy inventory # (size, mtime) id, no byte reads
 zarrsum /path/to/dataset_dir --arrays --groups # also per-array and per-group ids (subset pins)
 zarrsum /path/to/store.zarr --json             # full result as JSON
 zarrsum /path/to/store.zarr --workers 1        # serial (default: auto-parallel)
