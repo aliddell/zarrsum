@@ -43,9 +43,10 @@ policies.
 
 ### 1.3 Metadata canonicalization `C(bytes)`
 
-    C(b):
+    C(b, path):
         try obj = json.parse(b)
-        except: return b""                        # non-JSON metadata contributes nothing
+        except: raise DatasetMetadataError(path)  # invalid metadata JSON fails; a release is not
+                                                  # identified over an empty placeholder
         if obj is a JSON object:
             drop the keys "dimension_separator" and "chunk_key_encoding"
         return json.dump(obj, sort_keys=True, separators=(",",":")).utf8
@@ -109,6 +110,10 @@ made an id.
 
 - **Excluded: `.zmetadata`.** Consolidated metadata is not hashed. Adding or removing it does
   not change the id. The authoritative metadata for hashing is the per-node metadata files.
+  **Read policy for a consumer:** two stores that share an id can still hold different
+  `.zmetadata`, so a consumer must not treat consolidated metadata as part of the identity. After
+  a `verify`, read the per-node metadata, or regenerate `.zmetadata` from it. Pinning the
+  consolidated bytes themselves would need a separate exact-release identity (not built).
 - **Excluded: symlinks.** A symlink to a file or a directory is skipped entirely. The id covers
   the real files in the tree, not symlink targets.
 - **Excluded: ignored directories.** Directory names matching the ignore globs (default
@@ -119,8 +124,10 @@ made an id.
   canonicalization), the tree structure, the canonical chunk keys, and every non-Zarr file's
   content.
 
-A `bytes` id identifies the exact stored files, not the logical array alone: a layout change
-(re-chunk, re-shard, re-compress) changes the id.
+A `bytes` id is a normalized fingerprint of the stored content — the exact chunk and shard bytes
+and the canonicalized per-node metadata — not a byte-for-byte image of the directory, and not the
+logical array alone. A layout change (re-chunk, re-shard, re-compress) changes it. Invalid
+metadata JSON is refused (`DatasetMetadataError`), so an id is never computed over a placeholder.
 
 ## 4. Test vectors
 

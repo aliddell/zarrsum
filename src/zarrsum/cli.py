@@ -6,7 +6,8 @@ import json
 import sys
 import time
 
-from .core import hash_dataset, DatasetChangedError, DatasetBusyError
+from .core import (hash_dataset, DatasetChangedError, DatasetBusyError,
+                   DatasetMetadataError)
 from . import __version__
 
 
@@ -44,7 +45,7 @@ def main(argv=None) -> int:
         r = hash_dataset(a.path, max_workers=a.workers, policy=a.policy,
                          ignore=a.ignore, cache=a.cache, verify=a.verify,
                          fence=a.fence, min_quiet_s=a.min_quiet)
-    except (DatasetChangedError, DatasetBusyError) as e:
+    except (DatasetChangedError, DatasetBusyError, DatasetMetadataError) as e:
         print(f"zarrsum: {e}", file=sys.stderr)
         return 2
     wall = round(time.time() - t0, 2)

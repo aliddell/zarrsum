@@ -29,7 +29,7 @@ import json
 import os
 import sys
 
-from .core import hash_dataset
+from .core import hash_dataset, DatasetMetadataError
 
 MANIFEST_VERSION = 1
 
@@ -144,7 +144,7 @@ def main(argv=None) -> int:
             e = add_dataset(a.manifest, a.name, a.dataset_path, policy=a.policy, unit=a.unit,
                             subpath=a.path, max_workers=a.workers, fence=a.fence,
                             min_quiet_s=a.min_quiet)
-        except (KeyError, ValueError) as e:
+        except (KeyError, ValueError, DatasetMetadataError) as e:
             print(f"zarrsum-manifest: {e}", file=sys.stderr)
             return 2
         where = f"{e['unit']}:{e['subpath']}" if e["subpath"] else e["unit"]
@@ -154,7 +154,7 @@ def main(argv=None) -> int:
     try:
         r = verify_dataset(a.manifest, a.name, a.dataset_path, max_workers=a.workers,
                            fence=a.fence, min_quiet_s=a.min_quiet)
-    except KeyError as e:
+    except (KeyError, DatasetMetadataError) as e:
         print(f"zarrsum-manifest: {e}", file=sys.stderr)
         return 2
     if r["ok"]:

@@ -321,6 +321,16 @@ def test_min_quiet_sees_a_fresh_metadata_write():
             zarrsum.hash_dataset(s, min_quiet_s=1000)  # .zarray/.zgroup just written
 
 
+def test_invalid_metadata_json_fails():
+    """Invalid Zarr metadata JSON must fail loudly, not contribute an empty value to the id."""
+    with tempfile.TemporaryDirectory() as base:
+        s = _build(os.path.join(base, "s"), ".", [2, 2], {"0.0": b"\x01" * 16})
+        with open(os.path.join(s, "a", ".zarray"), "w") as f:
+            f.write("{not valid json")
+        with pytest.raises(core.DatasetMetadataError):
+            zarrsum.hash_dataset(s)
+
+
 def test_min_quiet_refuses_recent_write():
     """The quiescence gate refuses a just-written store and allows one past the window."""
     with tempfile.TemporaryDirectory() as base:
@@ -346,5 +356,6 @@ if __name__ == "__main__":
     test_incremental_cache()
     test_fence_passes_when_quiescent()
     test_min_quiet_sees_a_fresh_metadata_write()
+    test_invalid_metadata_json_fails()
     test_min_quiet_refuses_recent_write()
     print("PASS")

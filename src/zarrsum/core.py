@@ -65,6 +65,12 @@ class DatasetBusyError(RuntimeError):
     in flight. This is a coarse quiescence gate, not a lock: quiesce writes and retry."""
 
 
+class DatasetMetadataError(RuntimeError):
+    """A Zarr metadata file (``.zarray``, ``.zgroup``, ``.zattrs``, ``zarr.json``) could not be
+    parsed as JSON. A release cannot be identified from invalid metadata, so the id is refused
+    rather than computed over an empty placeholder. Fix or remove the named file."""
+
+
 def _default_workers() -> int:
     return min(32, (os.cpu_count() or 4) * 4)
 
@@ -174,11 +180,16 @@ def _hash_bytes_cached(paths: list[str], root: str, workers: int, cache_path: st
     return dig
 
 
-def _canon_bytes(b: bytes) -> bytes:
+def _canon_bytes(b: bytes, path: str) -> bytes:
+    """Canonicalize a Zarr metadata file for hashing: parse JSON, drop the layout keys in
+    ``DROP_META_KEYS``, re-serialize sorted and compact. Raise ``DatasetMetadataError`` if the
+    bytes are not valid JSON; a release must not be identified from invalid metadata (it used to
+    contribute an empty value, so a corrupt file hashed the same as a different corrupt file)."""
     try:
         obj = json.loads(b)
-    except (ValueError, TypeError):
-        return b""
+    except (ValueError, TypeError) as e:
+        raise DatasetMetadataError(
+            f"{path}: Zarr metadata is not valid JSON ({e}); fix or remove the file.") from e
     if isinstance(obj, dict):
         obj = {k: v for k, v in obj.items() if k not in DROP_META_KEYS}
     return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
@@ -306,7 +317,8 @@ def _meta_items(d: str, files: list, cache: dict, order) -> list[bytes]:
     items = []
     for m in order:
         if m in files:
-            items.append(m.encode() + b"=" + _canon_bytes(cache.get(os.path.join(d, m), b"")))
+            p = os.path.join(d, m)
+            items.append(m.encode() + b"=" + _canon_bytes(cache.get(p, b""), p))
     return items
 
 
