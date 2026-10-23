@@ -285,6 +285,42 @@ def test_fence_detects_change_during_hashing(monkeypatch):
             zarrsum.hash_dataset(s, policy="bytes", fence=True, max_workers=1)
 
 
+def test_fence_detects_metadata_change_during_hashing(monkeypatch):
+    """A metadata file rewritten between discovery and the post-hash re-stat must abort the run.
+    Metadata is read at discovery, not in the hashing phase, so this guards the window the data
+    fence alone used to miss."""
+    with tempfile.TemporaryDirectory() as base:
+        s = _build(os.path.join(base, "s"), ".", [2, 2], {"0.0": b"\x01" * 16})
+        zarray = os.path.join(s, "a", ".zarray")
+        orig = core._hash_file_bytes
+        fired = {"done": False}
+
+        def mutating(path):
+            h = orig(path)
+            if not fired["done"]:  # on the first data-file hash, rewrite a metadata file
+                fired["done"] = True
+                meta = json.load(open(zarray))
+                meta["fill_value"] = 123456789  # changes the file size, so (size, mtime) differs
+                json.dump(meta, open(zarray, "w"))
+            return h
+
+        monkeypatch.setattr(core, "_hash_file_bytes", mutating)
+        with pytest.raises(core.DatasetChangedError):
+            zarrsum.hash_dataset(s, policy="bytes", fence=True, max_workers=1)
+
+
+def test_min_quiet_sees_a_fresh_metadata_write():
+    """The quiescence gate must consider metadata mtimes, not only data files."""
+    with tempfile.TemporaryDirectory() as base:
+        s = _build(os.path.join(base, "s"), ".", [2, 2], {"0.0": b"\x01" * 16})
+        # make the data file old, leave the metadata freshly written
+        old = core.time.time_ns() - 3600 * 10**9
+        for name in ("0.0",):
+            os.utime(os.path.join(s, "a", name), ns=(old, old))
+        with pytest.raises(zarrsum.DatasetBusyError):
+            zarrsum.hash_dataset(s, min_quiet_s=1000)  # .zarray/.zgroup just written
+
+
 def test_min_quiet_refuses_recent_write():
     """The quiescence gate refuses a just-written store and allows one past the window."""
     with tempfile.TemporaryDirectory() as base:
@@ -309,5 +345,6 @@ if __name__ == "__main__":
     test_ignore_transient_stores()
     test_incremental_cache()
     test_fence_passes_when_quiescent()
+    test_min_quiet_sees_a_fresh_metadata_write()
     test_min_quiet_refuses_recent_write()
     print("PASS")

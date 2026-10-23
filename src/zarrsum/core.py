@@ -253,18 +253,28 @@ def _crawl(root: str, workers: int, ignore) -> dict:
     return entries
 
 
-def _prefetch_meta(entries: dict, workers: int) -> dict:
+def _prefetch_meta(entries: dict, workers: int):
+    """Read every metadata file, and capture each file's ``(size, mtime_ns)`` at the moment it
+    is read. The stat is taken before the read, so a change during the read is caught by the
+    fence. Returns ``(cache, meta_sig)``: the bytes by path, and the discovery-time signatures
+    by path. The fence and the quiescence gate need ``meta_sig``, because the metadata is read
+    here, at discovery, not during the later hashing phase, so its signature cannot be collected
+    with the data files just before hashing."""
     paths = [os.path.join(d, f) for d, (_s, files) in entries.items()
              for f in files if f in META_NAMES]
 
     def rd(p):
         try:
+            sig = _stat_sig(p)
             with open(p, "rb") as fh:
-                return p, fh.read()
+                return p, fh.read(), sig
         except OSError:
-            return p, b""
+            return p, b"", None
 
-    return dict(_run(rd, paths, workers))
+    rows = _run(rd, paths, workers)
+    cache = {p: data for p, data, _sig in rows}
+    meta_sig = {p: sig for p, _data, sig in rows if sig is not None}
+    return cache, meta_sig
 
 
 def _is_array_cached(d: str, files: list, cache: dict) -> bool:
@@ -337,7 +347,7 @@ def _build_group(d: str, entries: dict, cache: dict, nonzarr: list) -> dict:
 
 def _discover_parallel(root: str, workers: int, ignore):
     entries = _crawl(root, workers, ignore)
-    cache = _prefetch_meta(entries, workers)
+    cache, meta_sig = _prefetch_meta(entries, workers)
     stores, nonzarr = [], []
     stack = [root]
     while stack:
@@ -354,7 +364,7 @@ def _discover_parallel(root: str, workers: int, ignore):
                 nonzarr.append(os.path.join(d, f))
             for s in subs:
                 stack.append(os.path.join(d, s))
-    return stores, nonzarr
+    return stores, nonzarr, meta_sig
 
 
 # ---------- phase 3: combine ----------
@@ -382,18 +392,20 @@ def hash_dataset(root: str, max_workers=None, policy: str = "bytes", ignore=None
 
     Two optional mid-write guards; neither changes the id:
 
-    - ``min_quiet_s``: a quiescence gate. Before hashing, stat every file and raise
-      ``DatasetBusyError`` if the newest mtime is within ``min_quiet_s`` seconds of now, i.e.
-      a write may still be in flight. Coarse, not a lock.
-    - ``fence``: a stat fence. Snapshot ``(size, mtime)`` of every file before hashing and
-      re-stat after; raise ``DatasetChangedError`` if any file changed or vanished during the
-      window. Catches an in-place edit, an append, or a metadata rewrite of a file that was
-      present at discovery. It cannot see a file created after discovery."""
+    - ``min_quiet_s``: a quiescence gate. Raise ``DatasetBusyError`` if the newest mtime over
+      the data, non-Zarr, and metadata files is within ``min_quiet_s`` seconds of now, i.e. a
+      write may still be in flight. Coarse, not a lock.
+    - ``fence``: a stat fence. Snapshot ``(size, mtime)`` of every file and re-stat after
+      hashing; raise ``DatasetChangedError`` if any file changed or vanished during the window.
+      The data and non-Zarr files are snapshotted before hashing; the per-node metadata is
+      snapshotted at discovery, when its bytes are read (the stat is taken before the read), so
+      a metadata rewrite during the run is caught too. It cannot see a file created after
+      discovery."""
     if policy not in FORMATS:
         raise ValueError(f"policy must be one of {sorted(FORMATS)}")
     w = _default_workers() if max_workers is None else max(1, max_workers)
     ign = DEFAULT_IGNORE if ignore is None else tuple(ignore)
-    stores, nonzarr = _discover_parallel(root, w, ign)
+    stores, nonzarr, meta_sig = _discover_parallel(root, w, ign)
 
     leaf_abs = []
 
@@ -407,10 +419,11 @@ def hash_dataset(root: str, max_workers=None, policy: str = "bytes", ignore=None
     for _rel, node in stores:
         _collect(node)
 
-    fence_paths = leaf_abs + nonzarr
+    data_paths = leaf_abs + nonzarr
     base_sig = None
     if fence or min_quiet_s is not None:
-        base_sig = dict(zip(fence_paths, _run(_stat_sig, fence_paths, w)))
+        base_sig = dict(zip(data_paths, _run(_stat_sig, data_paths, w)))
+        base_sig.update(meta_sig)  # metadata signatures from discovery (stat taken before the read)
         if min_quiet_s is not None:
             newest = max((s[1] for s in base_sig.values() if s), default=0)
             if newest and time.time_ns() - newest < int(min_quiet_s * 1e9):
@@ -427,8 +440,9 @@ def hash_dataset(root: str, max_workers=None, policy: str = "bytes", ignore=None
     dig.update(_hash_many(nonzarr, w, "bytes"))
 
     if fence:
+        fence_paths = data_paths + list(meta_sig)
         after = dict(zip(fence_paths, _run(_stat_sig, fence_paths, w)))
-        changed = [p for p in fence_paths if after[p] != base_sig[p]]
+        changed = [p for p in fence_paths if after[p] != base_sig.get(p)]
         if changed:
             raise DatasetChangedError(
                 f"{len(changed)} file(s) changed during hashing (e.g. {changed[0]}); the "
