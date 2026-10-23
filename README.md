@@ -30,6 +30,9 @@ changed, and the manifest can pin a whole store or a subset of its arrays.
   and the file inventory change); a `dimension_separator` or `chunk_key_encoding` change
   alone does not.
 
+The byte-level format is frozen in [`SPEC.md`](SPEC.md), with test vectors in
+`tests/test_identity.py`. A second implementation that follows `SPEC.md` computes the same id.
+
 ## Install
 
 ```
