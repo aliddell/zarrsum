@@ -6,7 +6,10 @@ import json
 import os
 import tempfile
 
+import pytest
+
 import zarrsum
+import zarrsum.core as core
 
 
 def _build(d, sep, chunks, chunkbytes):
@@ -254,6 +257,43 @@ def test_incremental_cache():
         assert fresh != id2, "verify re-reads the bytes and sees the change"
 
 
+def test_fence_passes_when_quiescent():
+    """The stat fence must not change the id and must not trip on a store nobody is writing."""
+    with tempfile.TemporaryDirectory() as base:
+        s = _build(os.path.join(base, "s"), ".", [2, 2], {"0.0": b"\x01" * 16})
+        plain = zarrsum.hash_dataset(s)["dataset_id"]
+        fenced = zarrsum.hash_dataset(s, fence=True)
+        assert fenced["dataset_id"] == plain, "the fence must not change the id"
+
+
+def test_fence_detects_change_during_hashing(monkeypatch):
+    """A file that changes between discovery and the post-hash re-stat must abort the run."""
+    with tempfile.TemporaryDirectory() as base:
+        s = _build(os.path.join(base, "s"), ".", [2, 2], {"0.0": b"\x01" * 16})
+        chunk = os.path.join(s, "a", "0.0")
+        orig = core._hash_file_bytes
+
+        def mutating(path):
+            h = orig(path)
+            if os.path.abspath(path) == os.path.abspath(chunk):
+                with open(chunk, "ab") as f:  # append mid-hash -> size and mtime change
+                    f.write(b"\x02")
+            return h
+
+        monkeypatch.setattr(core, "_hash_file_bytes", mutating)
+        with pytest.raises(core.DatasetChangedError):
+            zarrsum.hash_dataset(s, policy="bytes", fence=True, max_workers=1)
+
+
+def test_min_quiet_refuses_recent_write():
+    """The quiescence gate refuses a just-written store and allows one past the window."""
+    with tempfile.TemporaryDirectory() as base:
+        s = _build(os.path.join(base, "s"), ".", [2, 2], {"0.0": b"\x01" * 16})
+        with pytest.raises(zarrsum.DatasetBusyError):
+            zarrsum.hash_dataset(s, min_quiet_s=1000)  # written just now -> inside the window
+        assert zarrsum.hash_dataset(s, min_quiet_s=0)["dataset_id"], "a zero window must pass"
+
+
 if __name__ == "__main__":
     test_separator_independent_and_rechunk_sensitive()
     test_deterministic()
@@ -268,4 +308,6 @@ if __name__ == "__main__":
     test_symlinks_are_skipped()
     test_ignore_transient_stores()
     test_incremental_cache()
+    test_fence_passes_when_quiescent()
+    test_min_quiet_refuses_recent_write()
     print("PASS")

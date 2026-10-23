@@ -29,6 +29,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from blake3 import blake3
@@ -51,8 +52,17 @@ def _ignored(name: str, patterns) -> bool:
 
 
 class DatasetChangedError(RuntimeError):
-    """A file seen during discovery was gone when we hashed it. The dataset is being
-    written. A content id of a moving target is not well defined: quiesce writes and retry."""
+    """A file seen during discovery was gone, or changed, while we hashed it. The dataset is
+    being written. A content id of a moving target is not well defined: quiesce writes and
+    retry. The default hash path raises this only when a listed file disappears; the optional
+    stat fence (``fence=True``) also raises it when a file's size or mtime changed during the
+    discovery-to-hash window, so it catches an in-place edit, an append, or a metadata rewrite."""
+
+
+class DatasetBusyError(RuntimeError):
+    """The dataset was modified too recently to hash safely. With ``min_quiet_s`` set, the id
+    is refused when the newest file mtime is inside the quiet window, so a write may still be
+    in flight. This is a coarse quiescence gate, not a lock: quiesce writes and retry."""
 
 
 def _default_workers() -> int:
@@ -96,6 +106,16 @@ def _inventory_leaf(path: str) -> bytes:
         raise DatasetChangedError(f"{path} disappeared during hashing; quiesce writes and retry")
     return _h("size+mtime", [st.st_size.to_bytes(8, "little"),
                              st.st_mtime_ns.to_bytes(8, "little")])
+
+
+def _stat_sig(path: str):
+    """A file's ``(size, mtime_ns)``, or None if it is gone. Used by the stat fence and the
+    quiescence gate; neither reads bytes."""
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return None
+    return (st.st_size, st.st_mtime_ns)
 
 
 def _run(fn, items, workers):
@@ -353,12 +373,22 @@ def _combine(node: dict, dig: dict, arrays: list, groups: list, root: str) -> by
 
 
 def hash_dataset(root: str, max_workers=None, policy: str = "bytes", ignore=None,
-                 cache=None, verify=False) -> dict:
+                 cache=None, verify=False, fence=False, min_quiet_s=None) -> dict:
     """Hash a dataset tree. ``policy`` is 'bytes' (default) or 'inventory'. ``max_workers``
     sizes the thread pools (None = auto, 1 = serial); the id does not depend on it.
     ``ignore`` is a list of fnmatch patterns for directory names to skip (default:
     DEFAULT_IGNORE). ``cache`` is a path to a reuse cache (bytes policy only) so a new version
-    re-reads only changed files; ``verify`` ignores the old cache but refreshes it."""
+    re-reads only changed files; ``verify`` ignores the old cache but refreshes it.
+
+    Two optional mid-write guards; neither changes the id:
+
+    - ``min_quiet_s``: a quiescence gate. Before hashing, stat every file and raise
+      ``DatasetBusyError`` if the newest mtime is within ``min_quiet_s`` seconds of now, i.e.
+      a write may still be in flight. Coarse, not a lock.
+    - ``fence``: a stat fence. Snapshot ``(size, mtime)`` of every file before hashing and
+      re-stat after; raise ``DatasetChangedError`` if any file changed or vanished during the
+      window. Catches an in-place edit, an append, or a metadata rewrite of a file that was
+      present at discovery. It cannot see a file created after discovery."""
     if policy not in FORMATS:
         raise ValueError(f"policy must be one of {sorted(FORMATS)}")
     w = _default_workers() if max_workers is None else max(1, max_workers)
@@ -376,12 +406,33 @@ def hash_dataset(root: str, max_workers=None, policy: str = "bytes", ignore=None
 
     for _rel, node in stores:
         _collect(node)
+
+    fence_paths = leaf_abs + nonzarr
+    base_sig = None
+    if fence or min_quiet_s is not None:
+        base_sig = dict(zip(fence_paths, _run(_stat_sig, fence_paths, w)))
+        if min_quiet_s is not None:
+            newest = max((s[1] for s in base_sig.values() if s), default=0)
+            if newest and time.time_ns() - newest < int(min_quiet_s * 1e9):
+                age_s = (time.time_ns() - newest) / 1e9
+                raise DatasetBusyError(
+                    f"newest file changed {age_s:.1f}s ago, inside the {min_quiet_s}s quiet "
+                    f"window; a write may be in flight. Quiesce writes and retry.")
+
     if policy == "bytes" and cache:
         dig = _hash_bytes_cached(leaf_abs, root, w, cache, verify)
     else:
         mode = "size" if policy == "inventory" else "bytes"
         dig = _hash_many(leaf_abs, w, mode)
     dig.update(_hash_many(nonzarr, w, "bytes"))
+
+    if fence:
+        after = dict(zip(fence_paths, _run(_stat_sig, fence_paths, w)))
+        changed = [p for p in fence_paths if after[p] != base_sig[p]]
+        if changed:
+            raise DatasetChangedError(
+                f"{len(changed)} file(s) changed during hashing (e.g. {changed[0]}); the "
+                f"dataset is being written. Quiesce writes and retry.")
 
     arrays, groups, store_ids = [], [], []
     for rel, node in stores:

@@ -2,7 +2,7 @@
 
 See ``data-versioning/design/zarr-content-hash.md`` for the design and the decisions.
 """
-from .core import hash_dataset, DatasetChangedError
+from .core import hash_dataset, DatasetChangedError, DatasetBusyError
 
 __version__ = "0.1.0"
-__all__ = ["hash_dataset", "DatasetChangedError", "__version__"]
+__all__ = ["hash_dataset", "DatasetChangedError", "DatasetBusyError", "__version__"]

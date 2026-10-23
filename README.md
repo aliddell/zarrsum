@@ -48,7 +48,16 @@ zarrsum /path/to/store.zarr --policy inventory # (size, mtime) id, no byte reads
 zarrsum /path/to/dataset_dir --arrays --groups # also per-array and per-group ids (subset pins)
 zarrsum /path/to/store.zarr --json             # full result as JSON
 zarrsum /path/to/store.zarr --workers 1        # serial (default: auto-parallel)
+zarrsum /path/to/store.zarr --fence            # abort if a file changes mid-hash
+zarrsum /path/to/store.zarr --min-quiet 60     # refuse if the newest mtime is < 60 s old
 ```
+
+The id itself assumes a quiescent store; it is not defined for a store being written. Two
+optional guards help enforce that: `--min-quiet SECONDS` refuses to start while the newest
+file was touched inside the window, and `--fence` re-stats every file after hashing and
+aborts if any changed during the run (an in-place edit, an append, or a metadata rewrite). A
+file created after the crawl is not seen by either; neither is a substitute for quiescing
+writes.
 
 Library:
 
@@ -71,6 +80,15 @@ small JSON file (keep it in git) that pins each dataset by its zarrsum id.
 ```
 zarrsum-manifest add manifest.json training_data /path/to/data --policy inventory
 zarrsum-manifest verify manifest.json training_data          # exit 0 if it matches its pin
+```
+
+To pin a subset instead of the whole store, name the node with `--unit` and `--path` (the
+path a group or array has under `zarrsum --groups`/`--arrays`). `verify` then recomputes and
+compares that node alone, so a change to a sibling array leaves the pin valid:
+
+```
+zarrsum-manifest add manifest.json site_a /path/to/data --unit array --path g/a1
+zarrsum-manifest verify manifest.json site_a                 # compares the g/a1 array id
 ```
 
 A typical flow with DVC (which stores and transfers the data):

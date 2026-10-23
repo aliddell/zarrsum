@@ -6,7 +6,7 @@ import json
 import sys
 import time
 
-from .core import hash_dataset, DatasetChangedError
+from .core import hash_dataset, DatasetChangedError, DatasetBusyError
 from . import __version__
 
 
@@ -30,14 +30,21 @@ def main(argv=None) -> int:
                     help="reuse cache (bytes policy): re-read only changed files")
     ap.add_argument("--verify", action="store_true",
                     help="ignore the reuse cache (re-read everything) but refresh it")
+    ap.add_argument("--fence", action="store_true",
+                    help="re-stat every file after hashing; abort if any changed during the "
+                         "run (catches an in-place edit, append, or metadata rewrite)")
+    ap.add_argument("--min-quiet", type=float, default=None, metavar="SECONDS",
+                    help="refuse unless the newest file mtime is older than SECONDS (a coarse "
+                         "quiescence gate against a store still being written)")
     ap.add_argument("--version", action="version", version=f"zarrsum {__version__}")
     a = ap.parse_args(argv)
 
     t0 = time.time()
     try:
         r = hash_dataset(a.path, max_workers=a.workers, policy=a.policy,
-                         ignore=a.ignore, cache=a.cache, verify=a.verify)
-    except DatasetChangedError as e:
+                         ignore=a.ignore, cache=a.cache, verify=a.verify,
+                         fence=a.fence, min_quiet_s=a.min_quiet)
+    except (DatasetChangedError, DatasetBusyError) as e:
         print(f"zarrsum: {e}", file=sys.stderr)
         return 2
     wall = round(time.time() - t0, 2)
