@@ -96,7 +96,11 @@ changes the file bytes and so changes the id.
 
 A dataset root may hold one or more stores (a directory with a `.zgroup`, `.zarray`, or
 `zarr.json` marker) plus non-Zarr files. `rel` is a path relative to the dataset root; a store
-that is the root itself has `rel == "."`.
+that is the root itself has `rel == "."`. Every `rel` in this document — for a store, a group,
+an array, or a non-Zarr file, and the public group/array paths — uses `/` as the separator,
+independent of the host OS. The reference implementation normalizes the native separator to `/`
+at this boundary, so the id and the public node paths are identical on POSIX and Windows. The
+native separator is kept only for filesystem access and for chunk-key parsing (2.1).
 
     store_ser  = H("stores",  [ rel.utf8 ++ b"\x00" ++ store_id   for each store, sorted by rel ])
     nz_ser     = H("nonzarr", [ rel.utf8 ++ b"\x00" ++ L(file)    for each non-Zarr file, sorted by rel ])

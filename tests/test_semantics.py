@@ -209,6 +209,28 @@ def test_nested_store_worker_invariant():
         assert r["n_arrays"] == 2 and r["n_groups"] >= 2 and r["n_nonzarr"] == 1, r  # sidecar counted
 
 
+def test_public_paths_are_posix_and_support_slash_subset_pins():
+    """Store/group/array paths in the result are POSIX ('/'-separated), and a subset pin uses the
+    slash form. On Windows ``os.path.relpath`` would otherwise return backslashes and change both
+    the id (via the non-Zarr sidecar path) and the public node paths; this guards the contract on
+    POSIX and the cross-platform check is in SPEC.md's frozen vectors (run on Windows by review)."""
+    import json as _json
+    from zarrsum import manifest as M
+    with tempfile.TemporaryDirectory() as base:
+        d = _build_nested(base)  # root group, subgroup g, arrays g/a1 and g/a2, a sidecar
+        r = zarrsum.hash_dataset(d)
+        rels = ([p for p, _ in r["stores"]] + [p for p, _ in r["groups"]]
+                + [p for p, _, _ in r["arrays"]])
+        assert all("\\" not in p for p in rels), rels
+        arrays = {p: i for p, i, _n in r["arrays"]}
+        assert "g/a1" in arrays and "g/a2" in arrays, arrays
+        # a slash-form subset pin round-trips through the manifest
+        mpath = os.path.join(base, "manifest.json")
+        M.add_dataset(mpath, "a1", d, policy="bytes", unit="array", subpath="g/a1")
+        assert M.verify_dataset(mpath, "a1")["ok"]
+        assert _json.load(open(mpath))["datasets"]["a1"]["id"] == arrays["g/a1"]
+
+
 def test_symlinks_are_skipped():
     with tempfile.TemporaryDirectory() as base:
         s = _build(os.path.join(base, "s"), "/", [2, 2], {"0.0": b"\x01" * 16})
@@ -351,6 +373,7 @@ if __name__ == "__main__":
     test_inventory_sees_same_size_rewrite_via_mtime()
     test_inventory_sees_size_change_and_metadata_edit()
     test_nested_store_worker_invariant()
+    test_public_paths_are_posix_and_support_slash_subset_pins()
     test_symlinks_are_skipped()
     test_ignore_transient_stores()
     test_incremental_cache()

@@ -155,7 +155,7 @@ def _hash_bytes_cached(paths: list[str], root: str, workers: int, cache_path: st
             old = {}
 
     def leaf(ap):
-        rel = os.path.relpath(ap, root)
+        rel = _posix_rel(ap, root)
         try:
             st = os.stat(ap)
         except FileNotFoundError:
@@ -193,6 +193,14 @@ def _canon_bytes(b: bytes, path: str) -> bytes:
     if isinstance(obj, dict):
         obj = {k: v for k, v in obj.items() if k not in DROP_META_KEYS}
     return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _posix_rel(path: str, start: str) -> str:
+    """A relative path for an identity or a public result: always POSIX ('/'-separated), so the
+    dataset id and the store/group/array/sidecar paths do not depend on the host OS separator
+    (on Windows ``os.path.relpath`` returns backslashes). Native paths are kept for filesystem
+    access and for chunk-key parsing, which splits on ``os.sep``."""
+    return os.path.relpath(path, start).replace(os.sep, "/")
 
 
 # ---------- chunk-key classification ----------
@@ -370,7 +378,7 @@ def _discover_parallel(root: str, workers: int, ignore):
                 node = _build_array(d, _enc_cached(d, files, cache), entries, cache, nonzarr)
             else:
                 node = _build_group(d, entries, cache, nonzarr)
-            stores.append((os.path.relpath(d, root), node))
+            stores.append((_posix_rel(d, root), node))
         else:
             for f in files:
                 nonzarr.append(os.path.join(d, f))
@@ -385,12 +393,12 @@ def _combine(node: dict, dig: dict, arrays: list, groups: list, root: str) -> by
         leaves = sorted((k, dig[ap]) for k, ap in node["leaves"])
         leaf_ser = _h("files", [k.encode() + b"\0" + hv for k, hv in leaves])
         aid = _h("array", node["meta"] + [leaf_ser])
-        arrays.append((os.path.relpath(node["abs"], root), aid, len(leaves)))
+        arrays.append((_posix_rel(node["abs"], root), aid, len(leaves)))
         return aid
     children = [(name, _combine(c, dig, arrays, groups, root)) for name, c in node["children"]]
     child_ser = _h("children", [n.encode() + b"\0" + cid for n, cid in children])
     gid = _h("group", node["meta"] + [child_ser])
-    groups.append((os.path.relpath(node["abs"], root), gid))
+    groups.append((_posix_rel(node["abs"], root), gid))
     return gid
 
 
@@ -464,7 +472,7 @@ def hash_dataset(root: str, max_workers=None, policy: str = "bytes", ignore=None
     for rel, node in stores:
         store_ids.append((rel, _combine(node, dig, arrays, groups, root)))
     store_ids.sort()
-    nz = sorted((os.path.relpath(p, root), dig[p]) for p in nonzarr)
+    nz = sorted((_posix_rel(p, root), dig[p]) for p in nonzarr)
     fmt = FORMATS[policy]
     store_ser = _h("stores", [r.encode() + b"\0" + i for r, i in store_ids])
     nz_ser = _h("nonzarr", [r.encode() + b"\0" + h for r, h in nz])
