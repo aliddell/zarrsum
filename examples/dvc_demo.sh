@@ -18,7 +18,7 @@ dvc init -q; dvc config core.analytics false
 
 echo "== producer: DVC tracks the bytes; the manifest pins the zarrsum id =="
 dvc add data                                             # DVC: one .dir pointer + cache
-python -m zarrsum.manifest add manifest.json training_data data --policy inventory
+python -m zarrsum.manifest add manifest.json training_data data --policy bytes
 dvc remote add -d store "$WORK/remote"
 git add -A; git commit -q -m "track data; pin zarrsum id"
 dvc push -q                                              # bytes -> remote (stands in for S3/Reef)
