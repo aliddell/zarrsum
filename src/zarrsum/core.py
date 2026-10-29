@@ -88,8 +88,13 @@ def _h(tag: str, items: list[bytes]) -> bytes:
 
 
 def _hash_file_bytes(path: str) -> bytes:
+    """BLAKE3 of the file bytes, on one thread. Files are already hashed concurrently by the
+    worker pool, so a BLAKE3 thread pool per file only oversubscribes the CPUs: on one Reef node
+    (64 workers, 1.3 GB shards) ``max_threads=AUTO`` cost 17% against a plain read, and one
+    thread matched the read rate with identical digests
+    (``data-versioning/reference/2026-10-28-reef-distributed-byte-pass.md``)."""
     try:
-        h = blake3(max_threads=blake3.AUTO)
+        h = blake3()
         with open(path, "rb") as f:
             while True:
                 b = f.read(READ_BLOCK)
