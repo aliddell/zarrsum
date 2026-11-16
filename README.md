@@ -125,3 +125,8 @@ real Zarr v2 dataset: 856 GB across 152,359 chunk files in 9,035 arrays, in 71 s
 with non-Zarr sidecar files interleaved (2026-10-19). Still to come: an incremental cache
 keyed by `(relpath, size, mtime)` so a new version re-hashes in minutes, parallel reads,
 and the DVC manifest integration.
+## Computed-path release experiment
+
+See [RELEASES.md](RELEASES.md) for the experimental release interface. It publishes from
+declared paths and retains bytes for recovery. Its release IDs are separate from the
+existing normalized zarrsum IDs.
