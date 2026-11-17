@@ -9,6 +9,9 @@ from __future__ import annotations
 from dataclasses import asdict
 import json
 import hashlib
+import ipaddress
+import configparser
+from urllib.parse import urlsplit
 import os
 from pathlib import Path
 import shutil
@@ -57,26 +60,61 @@ def object_key(value):
     return f"objects/{value[:2]}/{value[2:4]}/{value}"
 
 
+def fixture_endpoint(endpoint, allowed_endpoints=None):
+    """Accept only an explicit private fixture address and its selected port."""
+    allowed = (
+        {"http://127.0.0.1:13900"}
+        if allowed_endpoints is None
+        else set(allowed_endpoints)
+    )
+    parsed = urlsplit(endpoint)
+    if (
+        endpoint not in allowed
+        or parsed.scheme != "http"
+        or parsed.port != 13900
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or parsed.username
+        or parsed.password
+    ):
+        raise ValueError("endpoint is outside the isolated fixture allowlist")
+    try:
+        address = ipaddress.ip_address(parsed.hostname)
+    except ValueError as error:
+        raise ValueError("fixture endpoint needs a numeric private address") from error
+    if (
+        address.version != 4
+        or not address.is_private
+        or address.is_unspecified
+        or address.is_multicast
+    ):
+        raise ValueError("fixture endpoint needs a private IPv4 address")
+    return endpoint
+
+
 class Aliases:
     """Non-secret names. Removing a name makes no remote requests."""
 
-    def __init__(self, path):
+    def __init__(self, path, *, allowed_endpoints=None):
         self.path = Path(path)
+        self.allowed_endpoints = allowed_endpoints
 
     def list(self):
         return json.loads(self.path.read_bytes()) if self.path.exists() else {}
 
     def add(self, name, config):
         member(name)
+        endpoint = fixture_endpoint(config.get("endpoint", ""), self.allowed_endpoints)
         if config != {
-            "endpoint": "http://127.0.0.1:13900",
+            "endpoint": endpoint,
             "region": "garage",
             "bucket": "release-test",
             "prefix": "retained",
             "rclone_remote": "s3",
             "format": REPOSITORY["format"],
         }:
-            raise ValueError("only the isolated loopback fixture is allowed")
+            raise ValueError("only the isolated fixture configuration is allowed")
         found = self.list()
         if name in found:
             raise ValueError("alias exists")
@@ -185,9 +223,23 @@ def validate(data, info):
 
 
 class Boundary:
-    def __init__(self, client, rconfig, evidence, prefix="retained"):
-        if client.meta.endpoint_url != "http://127.0.0.1:13900":
-            raise ValueError("endpoint is outside the isolated fixture")
+    def __init__(
+        self, client, rconfig, evidence, prefix="retained", *, allowed_endpoints=None
+    ):
+        endpoint = fixture_endpoint(client.meta.endpoint_url, allowed_endpoints)
+        if allowed_endpoints is not None:
+            config = configparser.ConfigParser(interpolation=None)
+            config.read(rconfig)
+            remote = config["s3"]
+            if (
+                remote.get("endpoint") != endpoint
+                or remote.get("region") != "garage"
+                or remote.getboolean("env_auth", fallback=True)
+                or not remote.getboolean("force_path_style", fallback=False)
+            ):
+                raise ValueError(
+                    "rclone configuration does not match the allowed SDK endpoint"
+                )
         self.client, self.bucket = client, "release-test"
         self.prefix = checked(prefix)
         self.evidence = Path(evidence)

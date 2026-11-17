@@ -2,7 +2,7 @@
 
 import pytest
 from zarrsum.releases import Store, canonical, digest
-from zarrsum.remotes import graph, local_get, Aliases, Boundary
+from zarrsum.remotes import graph, local_get, Boundary
 
 
 def release(tmp_path):
@@ -78,3 +78,48 @@ def test_plan_digest_survives_restart(tmp_path):
     fresh = Boundary(FakeClient(), tmp_path / "unused-config", tmp_path / "evidence")
     with pytest.raises(ValueError, match="transfer plan changed"):
         fresh.execute(plan, pin)
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "http://8.8.8.8:13900",
+        "http://0.0.0.0:13900",
+        "http://10.1.2.3:80",
+        "http://10.1.2.3:13900/path",
+        "http://user@10.1.2.3:13900",
+        "https://10.1.2.3:13900",
+    ],
+)
+def test_fixture_endpoint_rejects_unapproved_forms(endpoint):
+    from zarrsum.remotes import fixture_endpoint
+
+    with pytest.raises(ValueError):
+        fixture_endpoint(endpoint, {endpoint})
+
+
+def test_fixture_endpoint_requires_explicit_match():
+    from zarrsum.remotes import fixture_endpoint
+
+    allowed = {"http://10.1.2.3:13900"}
+    assert fixture_endpoint("http://10.1.2.3:13900", allowed) == "http://10.1.2.3:13900"
+    with pytest.raises(ValueError):
+        fixture_endpoint("http://10.1.2.4:13900", allowed)
+
+
+def test_rclone_endpoint_must_match_sdk(tmp_path):
+    class FakeClient:
+        class meta:
+            endpoint_url = "http://10.1.2.3:13900"
+
+    config = tmp_path / "rclone.conf"
+    config.write_text(
+        "[s3]\nendpoint=http://10.1.2.4:13900\nregion=garage\nenv_auth=false\nforce_path_style=true\n"
+    )
+    with pytest.raises(ValueError, match="rclone configuration"):
+        Boundary(
+            FakeClient(),
+            config,
+            tmp_path / "evidence",
+            allowed_endpoints={FakeClient.meta.endpoint_url},
+        )
