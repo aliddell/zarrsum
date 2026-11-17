@@ -19,8 +19,7 @@ import tempfile
 import time
 
 from botocore.exceptions import ClientError
-from hermes_core.adapters.rclone import RcloneAdapter
-from hermes_core.models import TransferSpec
+from .transport import RcloneTransport
 from .releases import (
     Store,
     FORMAT,
@@ -93,8 +92,71 @@ def fixture_endpoint(endpoint, allowed_endpoints=None):
     return endpoint
 
 
+def endpoint_url(value):
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("invalid S3 endpoint")
+    if parsed.port is not None and not 1 <= parsed.port <= 65535:
+        raise ValueError("invalid endpoint port")
+    if parsed.scheme == "http":
+        try:
+            address = ipaddress.ip_address(parsed.hostname)
+        except ValueError as error:
+            raise ValueError(
+                "HTTP fixture requires a private numeric address"
+            ) from error
+        if not address.is_private or address.is_unspecified or address.is_multicast:
+            raise ValueError("HTTP fixture requires a private address")
+    return value.rstrip("/")
+
+
+def remote_config(value):
+    import re
+
+    fields = {
+        "endpoint",
+        "bucket",
+        "prefix",
+        "region",
+        "addressing_style",
+        "profile",
+        "rclone_remote",
+        "rclone_config",
+        "format",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError("invalid remote configuration fields")
+    config = dict(value)
+    config["endpoint"] = endpoint_url(config["endpoint"])
+    if config["format"] != REPOSITORY["format"]:
+        raise ValueError("unsupported repository format")
+    checked(config["prefix"])
+    if (
+        not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", config["bucket"])
+        or ".." in config["bucket"]
+    ):
+        raise ValueError("invalid bucket")
+    for field in ("region", "profile", "rclone_remote"):
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", config[field]):
+            raise ValueError("invalid profile, region, or rclone name")
+    if (
+        config["addressing_style"] not in ("path", "virtual")
+        or not config["rclone_config"]
+    ):
+        raise ValueError("invalid addressing mode or rclone config reference")
+    return config
+
+
 class Aliases:
-    """Non-secret names. Removing a name makes no remote requests."""
+    """Store non-secret remote references. Removal makes no remote requests."""
 
     def __init__(self, path, *, allowed_endpoints=None):
         self.path = Path(path)
@@ -104,21 +166,15 @@ class Aliases:
         return json.loads(self.path.read_bytes()) if self.path.exists() else {}
 
     def add(self, name, config):
-        member(name)
-        endpoint = fixture_endpoint(config.get("endpoint", ""), self.allowed_endpoints)
-        if config != {
-            "endpoint": endpoint,
-            "region": "garage",
-            "bucket": "release-test",
-            "prefix": "retained",
-            "rclone_remote": "s3",
-            "format": REPOSITORY["format"],
-        }:
-            raise ValueError("only the isolated fixture configuration is allowed")
+        checked(name)
+        config = remote_config(config)
+        if self.allowed_endpoints is not None:
+            fixture_endpoint(config["endpoint"], self.allowed_endpoints)
         found = self.list()
         if name in found:
             raise ValueError("alias exists")
         found[name] = config
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         atomic_file(self.path, canonical(found))
 
     def remove(self, name):
@@ -224,13 +280,24 @@ def validate(data, info):
 
 class Boundary:
     def __init__(
-        self, client, rconfig, evidence, prefix="retained", *, allowed_endpoints=None
+        self,
+        client,
+        rconfig,
+        evidence,
+        prefix="retained",
+        *,
+        allowed_endpoints=None,
+        bucket="release-test",
+        rclone_remote="s3",
+        binary="rclone",
+        transport=None,
     ):
-        endpoint = fixture_endpoint(client.meta.endpoint_url, allowed_endpoints)
+        endpoint = endpoint_url(client.meta.endpoint_url)
         if allowed_endpoints is not None:
+            fixture_endpoint(endpoint, allowed_endpoints)
             config = configparser.ConfigParser(interpolation=None)
             config.read(rconfig)
-            remote = config["s3"]
+            remote = config[rclone_remote]
             if (
                 remote.get("endpoint") != endpoint
                 or remote.get("region") != "garage"
@@ -240,16 +307,12 @@ class Boundary:
                 raise ValueError(
                     "rclone configuration does not match the allowed SDK endpoint"
                 )
-        self.client, self.bucket = client, "release-test"
+        self.client, self.bucket = client, bucket
+        self.rclone_remote = rclone_remote
         self.prefix = checked(prefix)
         self.evidence = Path(evidence)
         self.evidence.mkdir(parents=True, exist_ok=True)
-        self.adapter = RcloneAdapter(
-            binary="/mnt/main0/home/aliddell/.bin/rclone",
-            config_path=str(rconfig),
-            poll_seconds=0.02,
-            stats_interval="100ms",
-        )
+        self.adapter = transport or RcloneTransport(binary=binary, config=rconfig)
         self.events, self.transfers = [], []
         self.requests = {}
 
@@ -260,12 +323,12 @@ class Boundary:
         client.meta.events.register("before-call.s3", count)
 
     def receipt(self, name, value):
-        from hermes_core.adapters import rclone
+        from . import transport
 
         sources = {
             "remotes": Path(__file__),
             "releases": Path(__file__).with_name("releases.py"),
-            "hermes_rclone": Path(rclone.__file__),
+            "direct_rclone": Path(transport.__file__),
         }
         value.update(
             utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -370,13 +433,8 @@ class Boundary:
         for offset in range(0, len(entries), 64):
             if digest(path.read_bytes()) != pinned:
                 raise ValueError("transfer plan changed before retry")
-            spec = TransferSpec(
-                source_path=plan["source"],
-                dest_path=plan["destination"],
-                overwrite=True,
-            )
             batch = [checked(e[0]) for e in entries[offset : offset + 64]]
-            result = self.adapter.run_files(spec, batch)
+            result = self.adapter.copy(plan["source"], plan["destination"], batch)
             self.transfers.append(
                 {
                     "plan_blake3": pinned,
@@ -386,14 +444,14 @@ class Boundary:
                 }
             )
             if not result.ok:
-                raise ValueError("Hermes file transfer failed: " + result.detail)
+                raise ValueError("rclone file transfer failed: " + result.detail)
             if interrupt_after is not None and offset // 64 + 1 >= interrupt_after:
                 raise InterruptedError(
                     "injected coordinator interruption after completed batch"
                 )
 
     def push(self, sender, release_id, name="push", interrupt_after=None):
-        sender = Path(sender)
+        sender = Path(sender).resolve(strict=True)
         self.repository(create=True)
         root, content, records = self.timed(
             "source-metadata", lambda: graph(release_id, lambda k: local_get(sender, k))
@@ -421,7 +479,11 @@ class Boundary:
 
         self.timed("target-reuse-readback", inspect)
         plan, pin = self.plan(
-            release_id, str(sender), f"s3:{self.bucket}/{self.prefix}", missing, name
+            release_id,
+            str(sender),
+            f"{self.rclone_remote}:{self.bucket}/{self.prefix}",
+            missing,
+            name,
         )
         self.timed("upload", lambda: self.execute(plan, pin, interrupt_after))
 
@@ -487,7 +549,7 @@ class Boundary:
         try:
             plan, pin = self.plan(
                 release_id,
-                f"s3:{self.bucket}/{self.prefix}",
+                f"{self.rclone_remote}:{self.bucket}/{self.prefix}",
                 str(incoming),
                 missing,
                 name,
@@ -534,32 +596,40 @@ class Boundary:
         return result
 
     def checkout(self, receiver, release_id, destination, name="checkout"):
-        destination = Path(destination)
+        result = verified_checkout(receiver, release_id, destination, timed=self.timed)
+        self.receipt(name, result)
+        return result
+
+
+def verified_checkout(receiver, release_id, destination, *, timed=None):
+    if timed is None:
+        timed = lambda _name, action: action()
+    identifier(release_id)
+    destination = Path(destination).absolute()
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    store = Store(receiver)
+    graph(release_id, lambda key: local_get(store.path, key))
+    private = Path(tempfile.mkdtemp(prefix=".checkout-", dir=destination.parent))
+    staging = private / "tree"
+    try:
+        timed("checkout-create", lambda: store.restore(release_id, staging, workers=4))
+        verdict = timed(
+            "destination-fresh-verify",
+            lambda: store.verify(release_id, staging, workers=4),
+        )
+        result = {
+            **verdict,
+            "coverage": "full",
+            "method": "fresh-BLAKE3-destination-readback",
+            "result": "verified",
+            "verifier": "direct-rclone-experimental",
+        }
         if destination.exists() or destination.is_symlink():
             raise FileExistsError(destination)
-        store = Store(receiver)
-        private = Path(tempfile.mkdtemp(prefix=".checkout-", dir=destination.parent))
-        staging = private / "tree"
-        try:
-            self.timed(
-                "checkout-create", lambda: store.restore(release_id, staging, workers=4)
-            )
-            verdict = self.timed(
-                "destination-fresh-verify",
-                lambda: store.verify(release_id, staging, workers=4),
-            )
-            receipt = {
-                **verdict,
-                "coverage": "full",
-                "method": "fresh-BLAKE3-destination-readback",
-                "result": "verified",
-                "verifier": "reef-v3+experimental-remotes",
-            }
-            if destination.exists() or destination.is_symlink():
-                raise FileExistsError(destination)
-            os.rename(staging, destination)
-            sync_directory(destination.parent)
-            self.receipt(name, receipt)
-        finally:
-            shutil.rmtree(private)
-        return receipt
+        os.rename(staging, destination)
+        sync_directory(destination.parent)
+        return result
+    finally:
+        shutil.rmtree(private)

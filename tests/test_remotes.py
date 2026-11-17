@@ -123,3 +123,37 @@ def test_rclone_endpoint_must_match_sdk(tmp_path):
             tmp_path / "evidence",
             allowed_endpoints={FakeClient.meta.endpoint_url},
         )
+
+
+def test_plan_mutation_before_retry_blocks_transport(tmp_path):
+    store, rid = release(tmp_path)
+
+    class FakeClient:
+        class meta:
+            endpoint_url = "http://127.0.0.1:13900"
+
+            class events:
+                @staticmethod
+                def register(*args):
+                    pass
+
+    class InterruptedTransport:
+        calls = 0
+
+        def copy(self, *args):
+            self.calls += 1
+            raise InterruptedError("test interruption")
+
+    transport = InterruptedTransport()
+    boundary = Boundary(
+        FakeClient(), tmp_path / "unused", tmp_path / "plans", transport=transport
+    )
+    path, pin = boundary.plan(
+        rid, str(store.path), "target", [["data", 3, "0" * 64]], "retry"
+    )
+    with pytest.raises(InterruptedError):
+        boundary.execute(path, pin)
+    path.write_bytes(path.read_bytes() + b" ")
+    with pytest.raises(ValueError, match="transfer plan changed"):
+        boundary.execute(path, pin)
+    assert transport.calls == 1

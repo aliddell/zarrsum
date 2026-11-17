@@ -130,3 +130,49 @@ and the DVC manifest integration.
 See [RELEASES.md](RELEASES.md) for the experimental release interface. It publishes from
 declared paths and retains bytes for recovery. Its release IDs are separate from the
 existing normalized zarrsum IDs.
+
+## Experimental direct-rclone release remotes
+
+Install `pip install '.[remote]'`. Install rclone separately. Hermes is not required.
+This bounded prototype accepts exact release IDs. It retains the existing release format.
+The current graph limit is 10,000 files. The current object limit is 32 MiB.
+It is not a production retention service.
+
+Keep the SDK credentials in a private AWS profile file. Keep matching credentials in a
+private rclone S3 config. The config must set an explicit endpoint, region, `env_auth=false`,
+and `force_path_style`. The SDK profile and the named rclone remote must use matching
+credentials. The release config stores profile and config-file references only.
+Use HTTPS for a public endpoint. HTTP is restricted to numeric private addresses.
+The compute test adds an exact allocated-endpoint check in its harness.
+
+For a prepared sender store, use this sequence. Set the paths and release ID first.
+The `fixture` profile and `payload` rclone remote refer to private credential files.
+Removing the alias does not remove data.
+
+```bash
+zarrsum-release remote --config remotes.json add test \
+  --endpoint http://10.1.2.3:13900 --bucket release-test --prefix retained \
+  --region garage --addressing-style path --profile fixture \
+  --rclone-remote payload --rclone-config /private/rclone.conf
+zarrsum-release remote --config remotes.json list
+zarrsum-release push "$SENDER" "$RELEASE" --remote test --remotes remotes.json --evidence evidence/push
+zarrsum-release fetch "$CACHE" "$RELEASE" --remote test --remotes remotes.json --evidence evidence/fetch
+zarrsum-release checkout "$CACHE" "$RELEASE" "$CHECKOUT" --evidence evidence/checkout
+zarrsum-release verify "$CACHE" "$RELEASE" --destination "$CHECKOUT"
+zarrsum-release pull "$CACHE" "$RELEASE" "$SECOND_CHECKOUT" --remote test --remotes remotes.json --evidence evidence/pull
+zarrsum-release remote --config remotes.json remove test
+```
+
+`--rclone-binary` and `--rclone-config` select explicit transport settings for each remote
+operation. `--bwlimit` supports bounded test transfers. Fetch creates no working checkout.
+Pull fetches, constructs a private checkout, and freshly verifies it before exposure.
+Checkout and destination verify work with the remote server stopped. `restore` remains
+available with its existing behavior. An existing destination is preserved.
+
+The backend copies bounded exact-key batches. It checks source presence before copying.
+It does not expand a missing file into a directory. It always copies each selected key.
+The release layer separately checks BLAKE3, complete graph membership, existing cache
+bytes, and destination bytes. Transfer success is not a verification receipt.
+SIGTERM cancels a CLI transfer and cleans its child processes and private temporary area.
+An external SIGKILL or host loss cannot run process cleanup. A new attempt still requires
+a complete byte check before success. Partial-download reuse is not implemented.
