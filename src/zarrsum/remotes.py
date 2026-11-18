@@ -424,7 +424,7 @@ class Boundary:
         )
         return path, pinned
 
-    def execute(self, path, pinned, interrupt_after=None):
+    def execute(self, path, pinned, interrupt_after=None, *, verified_keys=()):
         raw = path.read_bytes()
         if digest(raw) != pinned:
             raise ValueError("transfer plan changed")
@@ -433,7 +433,13 @@ class Boundary:
         for offset in range(0, len(entries), 64):
             if digest(path.read_bytes()) != pinned:
                 raise ValueError("transfer plan changed before retry")
-            batch = [checked(e[0]) for e in entries[offset : offset + 64]]
+            batch = [
+                checked(e[0])
+                for e in entries[offset : offset + 64]
+                if e[0] not in verified_keys
+            ]
+            if not batch:
+                continue
             result = self.adapter.copy(plan["source"], plan["destination"], batch)
             self.transfers.append(
                 {
@@ -450,7 +456,16 @@ class Boundary:
                     "injected coordinator interruption after completed batch"
                 )
 
-    def push(self, sender, release_id, name="push", interrupt_after=None):
+    def push(
+        self,
+        sender,
+        release_id,
+        name="push",
+        interrupt_after=None,
+        *,
+        resume_plan=None,
+        plan_digest=None,
+    ):
         sender = Path(sender).resolve(strict=True)
         self.repository(create=True)
         root, content, records = self.timed(
@@ -474,18 +489,70 @@ class Boundary:
                 if existing is None:
                     missing.append([key, *info])
                 else:
-                    validate(existing, info)
+                    try:
+                        validate(existing, info)
+                    except ValueError as error:
+                        raise ValueError("corrupt remote object: " + key) from error
                     reused += 1
 
         self.timed("target-reuse-readback", inspect)
-        plan, pin = self.plan(
-            release_id,
-            str(sender),
-            f"{self.rclone_remote}:{self.bucket}/{self.prefix}",
-            missing,
-            name,
+        destination = f"{self.rclone_remote}:{self.bucket}/{self.prefix}"
+        verified_keys = set()
+        if resume_plan is None:
+            plan, pin = self.plan(release_id, str(sender), destination, missing, name)
+        else:
+            plan = Path(resume_plan)
+            raw = plan.read_bytes()
+            pin = identifier(plan_digest)
+            if digest(raw) != pin:
+                raise ValueError("transfer plan changed before resume")
+            document = json.loads(raw)
+            if (
+                set(document)
+                != {"version", "release_id", "source", "destination", "entries"}
+                or document["version"] != 1
+                or document["release_id"] != release_id
+                or document["source"] != str(sender)
+                or document["destination"] != destination
+                or not isinstance(document["entries"], list)
+                or len(document["entries"]) > MAX_FILES
+            ):
+                raise ValueError(
+                    "resume plan does not match this release and repositories"
+                )
+            planned = set()
+            for entry in document["entries"]:
+                if (
+                    not isinstance(entry, list)
+                    or len(entry) != 3
+                    or not isinstance(entry[0], str)
+                    or entry[0] == root_key
+                    or entry[0] not in content
+                    or entry[1:] != content[entry[0]]
+                    or entry[0] in planned
+                ):
+                    raise ValueError("resume plan does not match the validated graph")
+                planned.add(entry[0])
+            missing_keys = {entry[0] for entry in missing}
+            if not missing_keys <= planned:
+                raise ValueError("resume plan omits a currently missing graph object")
+            verified_keys = planned - missing_keys
+            atomic_file(
+                self.evidence / (name + ".resume.json"),
+                canonical(
+                    {
+                        "plan": str(plan),
+                        "blake3": pin,
+                        "reused_planned_keys": len(verified_keys),
+                    }
+                ),
+            )
+        self.timed(
+            "upload",
+            lambda: self.execute(
+                plan, pin, interrupt_after, verified_keys=verified_keys
+            ),
         )
-        self.timed("upload", lambda: self.execute(plan, pin, interrupt_after))
 
         def target_check():
             for key, info in content.items():

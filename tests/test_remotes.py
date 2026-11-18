@@ -157,3 +157,54 @@ def test_plan_mutation_before_retry_blocks_transport(tmp_path):
     with pytest.raises(ValueError, match="transfer plan changed"):
         boundary.execute(path, pin)
     assert transport.calls == 1
+
+
+def test_resume_uses_same_plan_and_reuses_verified_objects(tmp_path):
+    store, rid = release(tmp_path)
+    from zarrsum.remotes import REPOSITORY
+    from zarrsum.transport import TransferResult
+
+    class FakeClient:
+        class meta:
+            endpoint_url = "http://127.0.0.1:13900"
+
+            class events:
+                @staticmethod
+                def register(*args):
+                    pass
+
+    class Copy:
+        calls = []
+
+        def copy(self, source, destination, keys):
+            self.calls.append(keys)
+            for key in keys:
+                objects[key] = (store.path / key).read_bytes()
+            return TransferResult(True, "transferred")
+
+    objects = {"repository.json": canonical(REPOSITORY)}
+    copied = Copy()
+    b = Boundary(
+        FakeClient(), tmp_path / "unused", tmp_path / "evidence", transport=copied
+    )
+    b.repository = lambda create=False: None
+    b.maybe = lambda key: objects.get(key)
+    b.get = lambda key: objects[key]
+    b.conditional = lambda key, data: objects.setdefault(key, data) and "created"
+    _, content, _ = graph(rid, lambda key: local_get(store.path, key))
+    entries = [
+        [key, *info] for key, info in content.items() if not key.startswith("releases/")
+    ]
+    path, pin = b.plan(
+        rid, str(store.path), "s3:release-test/retained", entries, "initial"
+    )
+    first = entries[0][0]
+    objects[first] = (store.path / first).read_bytes()
+    result = b.push(store.path, rid, resume_plan=path, plan_digest=pin)
+    assert result["plan_blake3"] == pin and result["reused_keys"] == 1
+    assert first not in [key for batch in copied.calls for key in batch]
+    assert digest(path.read_bytes()) == pin
+    raw = path.read_bytes()
+    path.write_bytes(raw + b" ")
+    with pytest.raises(ValueError, match="plan changed"):
+        b.push(store.path, rid, resume_plan=path, plan_digest=pin)

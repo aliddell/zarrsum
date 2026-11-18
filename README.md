@@ -176,3 +176,28 @@ bytes, and destination bytes. Transfer success is not a verification receipt.
 SIGTERM cancels a CLI transfer and cleans its child processes and private temporary area.
 An external SIGKILL or host loss cannot run process cleanup. A new attempt still requires
 a complete byte check before success. Partial-download reuse is not implemented.
+
+### Experimental pinned push retry
+
+An interrupted push leaves its original `push.plan.json` and `push.submission.json` in
+the selected evidence directory. Retry the same release, sender path, remote, and prefix.
+Supply the original digest from the submission record. Do not edit the plan.
+
+```bash
+zarrsum-release push "$SENDER" "$RELEASE" --remote test --remotes remotes.json \
+  --evidence evidence/retry --resume-plan evidence/first/push.plan.json \
+  --plan-digest "$ORIGINAL_PLAN_BLAKE3"
+```
+
+Resume checks the plan identity against the complete source graph and destination.
+It reads and verifies existing target content before reusing any key. It preserves the
+original plan bytes and digest. Target readback and conditional root publication still run.
+A corrupt existing object causes refusal. The remote owner must restore or remove the
+identified corrupt object before retry. This command does not silently overwrite it.
+The 10,000-entry plan and 10,000-file remote graph limits remain unchanged.
+
+`--transfer-timeout SECONDS` bounds each rclone subprocess, including probes and copies.
+Its default is 3600 seconds. Use an explicit smaller value for bounded failure tests.
+An expired deadline stops and reaps the child process and fails the operation. It does
+not mark a partial remote release complete. This bound is separate from rclone's HTTP
+idle timeout and from the allocation time limit.

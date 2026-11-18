@@ -88,3 +88,25 @@ def test_offline_checkout_preserves_existing_and_detects_change(tmp_path):
 def test_environment_has_no_hermes():
     code = "import importlib.util; assert importlib.util.find_spec('hermes_core') is None; import zarrsum.remote_cli"
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+@pytest.mark.parametrize("timeout", ["0", "-1", "nan", "inf"])
+def test_invalid_transfer_deadline_rejected_before_remote_access(tmp_path, timeout):
+    with pytest.raises(SystemExit) as stopped:
+        main(
+            [
+                "push",
+                str(tmp_path / "store"),
+                "0" * 64,
+                "--evidence",
+                str(tmp_path / "evidence"),
+                "--remote",
+                "test",
+                "--remotes",
+                str(tmp_path / "missing-config"),
+                "--transfer-timeout",
+                timeout,
+            ]
+        )
+    assert stopped.value.code == 2
+    assert not (tmp_path / "evidence").exists()

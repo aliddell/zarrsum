@@ -15,7 +15,7 @@ from .remotes import Aliases, Boundary, REPOSITORY, remote_config, verified_chec
 from .transport import RcloneTransport
 
 
-def connection(config, override=None, binary="rclone", bandwidth=None):
+def connection(config, override=None, binary="rclone", bandwidth=None, timeout=3600):
     import boto3
     from botocore.config import Config
 
@@ -59,11 +59,23 @@ def connection(config, override=None, binary="rclone", bandwidth=None):
         or remote.get("session_token", "") != (credentials.token or "")
     ):
         raise ValueError("SDK profile and rclone credentials do not match")
-    transport = RcloneTransport(binary=binary, config=path, bandwidth=bandwidth)
+    transport = RcloneTransport(
+        binary=binary, config=path, bandwidth=bandwidth, timeout=timeout
+    )
     return client, transport, path
 
 
 def main(argv=None):
+    def timeout_seconds(value):
+        import math
+
+        seconds = float(value)
+        if not math.isfinite(seconds) or not 0 < seconds <= 3600:
+            raise argparse.ArgumentTypeError(
+                "transfer timeout must be finite and between 0 and 3600 seconds"
+            )
+        return seconds
+
     parser = argparse.ArgumentParser(prog="zarrsum-release", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     remotes = sub.add_parser("remote")
@@ -91,6 +103,9 @@ def main(argv=None):
         item.add_argument("store")
         item.add_argument("release_id")
         item.add_argument("--evidence", required=True)
+        if command == "push":
+            item.add_argument("--resume-plan")
+            item.add_argument("--plan-digest")
         if command in ("checkout", "pull"):
             item.add_argument("destination")
         if command != "checkout":
@@ -99,6 +114,7 @@ def main(argv=None):
             item.add_argument("--rclone-binary", default="rclone")
             item.add_argument("--rclone-config")
             item.add_argument("--bwlimit")
+            item.add_argument("--transfer-timeout", type=timeout_seconds, default=3600)
     args = parser.parse_args(argv)
     evidence = None
     boundary = None
@@ -129,6 +145,13 @@ def main(argv=None):
             output = aliases.list()
         else:
             identifier(args.release_id)
+            if args.command == "push":
+                if bool(args.resume_plan) != bool(args.plan_digest):
+                    raise ValueError(
+                        "resume needs both --resume-plan and --plan-digest"
+                    )
+                if args.plan_digest:
+                    identifier(args.plan_digest)
             evidence = Path(args.evidence)
             evidence.mkdir(parents=True, exist_ok=True)
             if args.command == "checkout":
@@ -155,7 +178,11 @@ def main(argv=None):
                     raise FileExistsError(args.destination)
                 config = remote_config(Aliases(args.remotes).list()[args.remote])
                 client, transport, path = connection(
-                    config, args.rclone_config, args.rclone_binary, args.bwlimit
+                    config,
+                    args.rclone_config,
+                    args.rclone_binary,
+                    args.bwlimit,
+                    args.transfer_timeout,
                 )
                 boundary = Boundary(
                     client,
@@ -168,7 +195,12 @@ def main(argv=None):
                 )
                 version = transport.version()
                 if args.command == "push":
-                    output = boundary.push(args.store, args.release_id)
+                    output = boundary.push(
+                        args.store,
+                        args.release_id,
+                        resume_plan=args.resume_plan,
+                        plan_digest=args.plan_digest,
+                    )
                 else:
                     output = boundary.fetch(args.release_id, args.store)
                     if args.command == "pull":
