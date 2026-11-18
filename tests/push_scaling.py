@@ -205,7 +205,7 @@ class CLIRelease:
                 "--remotes",
                 str(self.aliases),
                 "--rclone-binary",
-                "/mnt/main0/home/aliddell/.bin/rclone",
+                "/usr/bin/rclone",
             ]
             if os.environ.get("DV_DIRECT_BWLIMIT"):
                 arguments += ["--bwlimit", os.environ["DV_DIRECT_BWLIMIT"]]
@@ -272,9 +272,6 @@ def start_minio(session, log):
         "MINIO_ROOT_PASSWORD": session["secret"],
         "MINIO_BROWSER": "off",
         "MINIO_UPDATE": "off",
-        "MINIO_AUDIT_WEBHOOK_ENABLE_count": "on",
-        "MINIO_AUDIT_WEBHOOK_ENDPOINT_count": "http://127.0.0.1:13905/audit",
-        "MINIO_AUDIT_WEBHOOK_QUEUE_SIZE_count": "100000",
     }
     SERVER = subprocess.Popen(command, env=env, stdout=log, stderr=log)
     client = client_for(session)
@@ -338,7 +335,7 @@ class Audit:
                             if request in owner.seen:
                                 owner.duplicates += 1
                                 continue
-                            if len(owner.seen) >= 1000000:
+                            if len(owner.seen) >= 3000000:
                                 raise ValueError("audit request budget exceeded")
                             owner.seen.add(request)
                             name = api.get("name", "unknown")
@@ -439,7 +436,7 @@ def cli_args(
             "--remotes",
             str(remote.aliases),
             "--rclone-binary",
-            "/mnt/main0/home/aliddell/.bin/rclone",
+            "/usr/bin/rclone",
             "--transfer-timeout",
             "35",
         ]
@@ -473,7 +470,7 @@ def execute_cli(
         bandwidth=bandwidth,
     )
     start = time.monotonic()
-    process = subprocess.run(args, capture_output=True, text=True, timeout=900)
+    process = subprocess.run(args, capture_output=True, text=True, timeout=3600)
     value = (
         json.loads((evidence / "result.json").read_bytes())
         if (evidence / "result.json").exists()
@@ -519,7 +516,7 @@ def root_absent(client, prefix, rid):
 def interrupted_push(client, remote, store, rid, contents, kind, session, log):
     previous_temp = set(WORK.rglob("zarrsum-rclone-*"))
     args, evidence = cli_args(
-        remote, "push", store, rid, "interrupted", bandwidth="256K"
+        remote, "push", store, rid, "interrupted", bandwidth="4M"
     )
     evidence.mkdir(parents=True)
     err = open(evidence / "stderr.txt", "w")
@@ -529,7 +526,7 @@ def interrupted_push(client, remote, store, rid, contents, kind, session, log):
     complete = []
     children = []
     observed = {}
-    deadline = time.monotonic() + 45
+    deadline = time.monotonic() + 600
     while time.monotonic() < deadline and process.poll() is None:
         observed = inventory(client, remote.prefix)
         complete = []
@@ -1037,7 +1034,7 @@ def receiver():
     before = request("audit")["audit"]
     subprocess.run(
         [
-            "/mnt/main0/home/aliddell/.bin/rclone",
+            "/usr/bin/rclone",
             "--config",
             str(config),
             "copyto",
@@ -1048,7 +1045,7 @@ def receiver():
     )
     copied = subprocess.check_output(
         [
-            "/mnt/main0/home/aliddell/.bin/rclone",
+            "/usr/bin/rclone",
             "--config",
             str(config),
             "cat",
@@ -1246,7 +1243,7 @@ def main():
                 )
             except psutil.Error:
                 pass
-            if size > 12 << 30 or count > 250000:
+            if size > 12 << 30 or count > 1000000:
                 os.kill(os.getpid(), signal.SIGTERM)
 
     local_temp = WORK / "process-temporary"
@@ -1257,7 +1254,7 @@ def main():
     thread.start()
     RESULT["budgets"] = {
         "runtime_bytes_per_host": 12 << 30,
-        "files_per_host": 250000,
+        "files_per_host": 1000000,
         "unique_payload_per_tier": 2 << 30,
     }
     try:

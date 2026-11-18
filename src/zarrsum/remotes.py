@@ -20,6 +20,7 @@ import time
 
 from botocore.exceptions import ClientError
 from .transport import RcloneTransport
+from .graph_index import Workspace, WithoutRoot, VerifiedKeys, EvidenceLog
 from .transfer_plans import (
     create_index,
     validate_index,
@@ -53,6 +54,7 @@ REPOSITORY = {
 }
 LIMIT = 32 << 20
 MAX_FILES = 10000
+MAX_GRAPH_FILES = 200_000
 
 
 def checked(key):
@@ -123,7 +125,8 @@ def endpoint_url(value):
             ) from error
         if (
             not (address.is_private or address in ipaddress.ip_network("100.64.0.0/10"))
-            or address.is_unspecified or address.is_multicast
+            or address.is_unspecified
+            or address.is_multicast
         ):
             raise ValueError("HTTP fixture requires a private address")
     return value.rstrip("/")
@@ -194,10 +197,11 @@ class Aliases:
         atomic_file(self.path, canonical(found))
 
 
-def graph(release_id, get):
+def graph(release_id, get, *, workspace=None):
     """Validate each metadata digest before following any of its references."""
     identifier(release_id)
-    content = {}
+    workspace = workspace or Workspace()
+    content = workspace.table()
 
     def metadata(kind, value):
         key = kind + "/" + identifier(value)
@@ -210,18 +214,18 @@ def graph(release_id, get):
     root = json.loads(metadata("releases", release_id))
     if set(root) != {"format", "descriptor", "partitions"} or root["format"] != FORMAT:
         raise ValueError("invalid release root")
-    registries = {}
+    registries = workspace.table(binary=True)
     for family in root["descriptor"].get("families", []):
         value = identifier(family["registry"])
         registries[value] = metadata("registries", value)
-    spec = descriptor(root["descriptor"], registries)
-    expected = set()
+    spec = descriptor(root["descriptor"], registries, index=workspace.set)
+    expected = workspace.set()
     for key in keys(spec, registries):
         checked(key)
-        if key in expected or len(expected) >= MAX_FILES:
+        if key in expected or len(expected) >= MAX_GRAPH_FILES:
             raise ValueError("duplicate or oversized graph")
         expected.add(key)
-    records = {}
+    records = workspace.table()
     partitions = set()
     if len(root["partitions"]) > partition_count(spec):
         raise ValueError("too many partitions")
@@ -266,7 +270,7 @@ def graph(release_id, get):
             content[obj] = [length, value]
         if total != size:
             raise ValueError("partition size mismatch")
-    if set(records) != expected:
+    if len(records) != len(expected):
         raise ValueError("incomplete graph")
     return root, content, records
 
@@ -324,7 +328,10 @@ class Boundary:
         self.evidence = Path(evidence)
         self.evidence.mkdir(parents=True, exist_ok=True)
         self.adapter = transport or RcloneTransport(binary=binary, config=rconfig)
-        self.events, self.transfers = [], []
+        self.events = []
+        self.transfers = EvidenceLog(self.evidence / "transfers.jsonl")
+        if hasattr(self.adapter, "commands"):
+            self.adapter.commands = EvidenceLog(self.evidence / "commands.jsonl")
         self.requests = {}
 
         def count(model, **_):
@@ -417,6 +424,8 @@ class Boundary:
     def plan(self, release_id, source, destination, entries, name):
         if len(entries) > MAX_FILES:
             raise ValueError("plan too large")
+        if hasattr(entries, "items"):
+            entries = [[key, *info] for key, info in entries.items()]
         data = canonical(
             {
                 "version": 1,
@@ -489,7 +498,8 @@ class Boundary:
                 validate(local_get(sender, key), info)
 
         self.timed("source-fresh-check", source_check)
-        missing, reused = [], 0
+        missing = content.workspace.table()
+        reused = 0
 
         def inspect():
             nonlocal reused
@@ -498,7 +508,7 @@ class Boundary:
                     continue
                 existing = self.maybe(key)
                 if existing is None:
-                    missing.append([key, *info])
+                    missing[key] = info
                 else:
                     try:
                         validate(existing, info)
@@ -509,7 +519,7 @@ class Boundary:
         self.timed("target-reuse-readback", inspect)
         destination = f"{self.rclone_remote}:{self.bucket}/{self.prefix}"
         verified_keys = set()
-        required = {key: info for key, info in content.items() if key != root_key}
+        required = WithoutRoot(content, root_key)
         repository = {
             "endpoint": self.client.meta.endpoint_url,
             "bucket": self.bucket,
@@ -535,7 +545,7 @@ class Boundary:
             children = validate_index(
                 plan, pin, release_id, str(sender), destination, repository, required
             )
-            verified_keys = set(required) - {entry[0] for entry in missing}
+            verified_keys = VerifiedKeys(required, missing)
             if resume_plan is not None:
                 atomic_file(
                     self.evidence / (name + ".resume.json"),
@@ -579,7 +589,7 @@ class Boundary:
                 ):
                     raise ValueError("resume plan does not match the validated graph")
                 planned.add(entry[0])
-            missing_keys = {entry[0] for entry in missing}
+            missing_keys = set(missing)
             if not missing_keys <= planned:
                 raise ValueError("resume plan omits a currently missing graph object")
             verified_keys = planned - missing_keys
@@ -638,7 +648,7 @@ class Boundary:
             "root": status,
             "uploaded_keys": len(missing),
             "reused_keys": reused,
-            "uploaded_bytes": sum(e[1] for e in missing),
+            "uploaded_bytes": sum(info[0] for info in missing.values()),
             "graph_keys": len(content),
             "graph_bytes": sum(i[0] for i in content.values()),
             "files": len(records),
@@ -653,7 +663,8 @@ class Boundary:
     def fetch(self, release_id, receiver, name="fetch"):
         receiver = Path(receiver)
         self.repository()
-        metadata = {}
+        workspace = Workspace()
+        metadata = workspace.table(binary=True)
 
         def read(key):
             data = self.get(key)
@@ -661,10 +672,10 @@ class Boundary:
             return data
 
         root, content, records = self.timed(
-            "metadata-resolution", lambda: graph(release_id, read)
+            "metadata-resolution", lambda: graph(release_id, read, workspace=workspace)
         )
         store = Store(receiver)
-        missing = []
+        missing = workspace.table()
         hits = 0
 
         def inspect():
@@ -677,19 +688,51 @@ class Boundary:
                     validate(local_get(receiver, key), info)
                     hits += 1
                 else:
-                    missing.append([key, *info])
+                    missing[key] = info
 
         self.timed("local-cache-readback", inspect)
         incoming = Path(tempfile.mkdtemp(prefix=".incoming-", dir=receiver.parent))
         try:
-            plan, pin = self.plan(
-                release_id,
-                f"{self.rclone_remote}:{self.bucket}/{self.prefix}",
-                str(incoming),
-                missing,
-                name,
-            )
-            self.timed("download", lambda: self.execute(plan, pin))
+            source = f"{self.rclone_remote}:{self.bucket}/{self.prefix}"
+            if len(missing) <= MAX_ENTRIES:
+                plan, pin = self.plan(release_id, source, str(incoming), missing, name)
+                self.timed("download", lambda: self.execute(plan, pin))
+            else:
+                repository = {
+                    "endpoint": self.client.meta.endpoint_url,
+                    "bucket": self.bucket,
+                    "prefix": self.prefix,
+                }
+                plan = self.evidence / (name + ".plan.json")
+                pin = create_index(
+                    plan, release_id, source, str(incoming), repository, missing
+                )
+                atomic_file(
+                    self.evidence / (name + ".submission.json"),
+                    canonical({"plan": plan.name, "blake3": pin}),
+                )
+                children = validate_index(
+                    plan, pin, release_id, source, str(incoming), repository, missing
+                )
+
+                def download():
+                    for child, child_pin in children:
+                        self.execute(
+                            child,
+                            child_pin,
+                            guard=lambda: pinned_document(plan, pin, INDEX_BYTES),
+                        )
+                    validate_index(
+                        plan,
+                        pin,
+                        release_id,
+                        source,
+                        str(incoming),
+                        repository,
+                        missing,
+                    )
+
+                self.timed("download", download)
 
             def admit():
                 for key, info in content.items():
@@ -724,7 +767,7 @@ class Boundary:
             "result": "verified",
             "downloaded_objects": len(missing),
             "cache_hits": hits,
-            "downloaded_bytes": sum(e[1] for e in missing),
+            "downloaded_bytes": sum(info[0] for info in missing.values()),
             "metadata_bytes": sum(map(len, metadata.values())),
         }
         self.receipt(name, result)

@@ -128,21 +128,27 @@ def _has_keys(files, grids):
     return bool(files) or any("present" not in g or g["present"] for g in grids)
 
 
-def read_registry(data):
-    """Parse registry bytes: sorted, unique member paths, one per line, final newline."""
+def iter_registry(data):
+    """Validate sorted registry members while retaining one decoded line at a time."""
+    import io
+
     if not data.endswith(b"\n"):
         raise ValueError("registry needs a final newline")
-    ids = data[:-1].decode("utf-8").split("\n")
     previous = None
-    for value in ids:
+    for line in io.BytesIO(data):
+        value = line[:-1].decode("utf-8")
         member(value)
         if previous is not None and not previous < value:
             raise ValueError("registry must be sorted and unique")
         previous = value
-    return ids
+        yield value
 
 
-def descriptor(value, registries=None):
+def read_registry(data):
+    return list(iter_registry(data))
+
+
+def descriptor(value, registries=None, *, index=None):
     """Normalize a finite key grammar and reject overlapping file namespaces.
 
     Version 1 is the first POC grammar with 64 partitions. Version 2 records the partition
@@ -170,7 +176,7 @@ def descriptor(value, registries=None):
     if not isinstance(families, list):
         raise ValueError("families must be a list")
     normalized = []
-    ids = set()
+    ids = set() if index is None else index()
     nonempty = _has_keys(files, grids)
     for family in families:
         if not isinstance(family, dict) or set(family) != {"registry", "count", "files", "grids"}:
@@ -186,20 +192,21 @@ def descriptor(value, registries=None):
         data = registries[registry]
         if digest(data) != registry:
             raise ValueError(f"corrupt registry: {registry}")
-        members = read_registry(data)
-        if type(family["count"]) is not int or family["count"] != len(members):
+        count = 0
+        for value in iter_registry(data):
+            if value in ids:
+                raise ValueError("an id appears in two families")
+            ids.add(value)
+            count += 1
+        if type(family["count"]) is not int or family["count"] != count:
             raise ValueError("family count does not match registry")
-        before = len(ids)
-        ids.update(members)
-        if len(ids) != before + len(members):
-            raise ValueError("an id appears in two families")
         nonempty = True
-        normalized.append({"registry": registry, "count": len(members),
+        normalized.append({"registry": registry, "count": count,
                            "files": t_files, "grids": t_grids})
     if len({f["registry"] for f in normalized}) != len(normalized):
         raise ValueError("duplicate family registry")
     if ids:
-        id_above = set()
+        id_above = set() if index is None else index()
         for path in ids:
             for a in ancestors(path):
                 if a in ids:
@@ -243,8 +250,8 @@ def keys(spec, registries=None):
     for family in spec.get("families", ()):
         template = list(family["files"])
         template_grids = family["grids"]
-        for line in registries[family["registry"]].splitlines():
-            base = line.decode("utf-8") + "/"
+        for value in iter_registry(registries[family["registry"]]):
+            base = value + "/"
             for name in template:
                 yield base + name
             yield from _grid_keys(template_grids, base)

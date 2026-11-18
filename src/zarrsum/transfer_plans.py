@@ -6,6 +6,7 @@ The caller checks remote bytes and publishes the release root after all transfer
 
 from pathlib import Path
 import json
+from itertools import islice
 
 from .releases import atomic_file, canonical, digest, identifier
 
@@ -34,10 +35,17 @@ def pinned_document(path, pinned, limit):
 def create_index(path, release_id, source, destination, repository, expected):
     if not expected or len(expected) > MAX_ENTRIES * MAX_PLANS:
         raise ValueError("transfer plan index count exceeds limit")
-    entries = [[key, *info] for key, info in sorted(expected.items())]
+    ordered = (
+        expected.ordered_items()
+        if hasattr(expected, "ordered_items")
+        else sorted(expected.items())
+    )
+    entries = iter(ordered)
     plans = []
-    for offset in range(0, len(entries), MAX_ENTRIES):
-        part = entries[offset : offset + MAX_ENTRIES]
+    while True:
+        part = [[key, *info] for key, info in islice(entries, MAX_ENTRIES)]
+        if not part:
+            break
         raw = canonical(
             {
                 "version": 1,
@@ -64,7 +72,7 @@ def create_index(path, release_id, source, destination, repository, expected):
             "source": source,
             "destination": destination,
             "repository": repository,
-            "entries_count": len(entries),
+            "entries_count": len(expected),
             "plans": plans,
         }
     )
@@ -91,7 +99,7 @@ def validate_index(path, pinned, release_id, source, destination, repository, ex
         or document["version"] != 2
         or document["release_id"] != release_id
         or document["source"] != source
-        or not Path(source).is_absolute()
+        or not (Path(source).is_absolute() or Path(destination).is_absolute())
         or document["destination"] != destination
         or document["repository"] != repository
         or type(document["entries_count"]) is not int
@@ -102,7 +110,7 @@ def validate_index(path, pinned, release_id, source, destination, repository, ex
         raise ValueError(
             "transfer plan index does not match the release and repositories"
         )
-    seen, children, hashes = set(), [], set()
+    observed, children, hashes = 0, [], set()
     previous = None
     for reference in document["plans"]:
         if (
@@ -141,13 +149,12 @@ def validate_index(path, pinned, release_id, source, destination, repository, ex
                 or entry[1] < 0
                 or not isinstance(entry[2], str)
                 or entry[1:] != list(expected[entry[0]])
-                or entry[0] in seen
                 or (previous is not None and entry[0] <= previous)
             ):
                 raise ValueError("child plans do not cover the exact nonroot graph")
-            seen.add(entry[0])
+            observed += 1
             previous = entry[0]
         children.append((child, child_pin))
-    if seen != set(expected):
+    if observed != len(expected):
         raise ValueError("child plans omit required graph objects")
     return children

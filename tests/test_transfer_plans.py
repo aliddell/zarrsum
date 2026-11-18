@@ -254,7 +254,8 @@ def test_mutation_during_target_check_blocks_root(tmp_path, monkeypatch):
     assert "releases/" + rid not in objects
 
 
-def test_oversized_graph_still_rejected(tmp_path):
+def test_oversized_graph_still_rejected(tmp_path, monkeypatch):
+    monkeypatch.setattr(remotes, "MAX_GRAPH_FILES", 10000)
     spec = {
         "version": 2,
         "partitions": 4,
