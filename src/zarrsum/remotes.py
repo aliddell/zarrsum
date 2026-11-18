@@ -92,7 +92,7 @@ def fixture_endpoint(endpoint, allowed_endpoints=None):
         raise ValueError("fixture endpoint needs a numeric private address") from error
     if (
         address.version != 4
-        or not address.is_private
+        or not (address.is_private or address in ipaddress.ip_network("100.64.0.0/10"))
         or address.is_unspecified
         or address.is_multicast
     ):
@@ -121,7 +121,10 @@ def endpoint_url(value):
             raise ValueError(
                 "HTTP fixture requires a private numeric address"
             ) from error
-        if not address.is_private or address.is_unspecified or address.is_multicast:
+        if (
+            not (address.is_private or address in ipaddress.ip_network("100.64.0.0/10"))
+            or address.is_unspecified or address.is_multicast
+        ):
             raise ValueError("HTTP fixture requires a private address")
     return value.rstrip("/")
 

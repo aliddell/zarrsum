@@ -208,3 +208,18 @@ def test_resume_uses_same_plan_and_reuses_verified_objects(tmp_path):
     path.write_bytes(raw + b" ")
     with pytest.raises(ValueError, match="plan changed"):
         b.push(store.path, rid, resume_plan=path, plan_digest=pin)
+
+
+def test_shared_cluster_address_fixture_and_public_rejection():
+    from zarrsum.remotes import endpoint_url, fixture_endpoint
+
+    endpoint = "http://100.64.2.116:13900"
+    assert endpoint_url(endpoint) == endpoint
+    assert fixture_endpoint(endpoint, {endpoint}) == endpoint
+    for value in ("http://8.8.8.8:13900", "http://100.63.255.255:13900",
+                  "http://100.128.0.0:13900", "http://0.0.0.0:13900",
+                  "http://224.0.0.1:13900"):
+        with pytest.raises(ValueError):
+            endpoint_url(value)
+        with pytest.raises(ValueError):
+            fixture_endpoint(value, {value})
