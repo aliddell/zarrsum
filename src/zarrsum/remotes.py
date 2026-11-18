@@ -20,6 +20,14 @@ import time
 
 from botocore.exceptions import ClientError
 from .transport import RcloneTransport
+from .transfer_plans import (
+    create_index,
+    validate_index,
+    pinned_document,
+    pinned_bytes,
+    INDEX_BYTES,
+    MAX_ENTRIES,
+)
 from .releases import (
     Store,
     FORMAT,
@@ -424,15 +432,15 @@ class Boundary:
         )
         return path, pinned
 
-    def execute(self, path, pinned, interrupt_after=None, *, verified_keys=()):
-        raw = path.read_bytes()
-        if digest(raw) != pinned:
-            raise ValueError("transfer plan changed")
-        plan = json.loads(raw)
+    def execute(
+        self, path, pinned, interrupt_after=None, *, verified_keys=(), guard=None
+    ):
+        plan = pinned_document(path, pinned, LIMIT)
         entries = plan["entries"]
         for offset in range(0, len(entries), 64):
-            if digest(path.read_bytes()) != pinned:
-                raise ValueError("transfer plan changed before retry")
+            if guard is not None:
+                guard()
+            pinned_bytes(path, pinned, LIMIT)
             batch = [
                 checked(e[0])
                 for e in entries[offset : offset + 64]
@@ -498,15 +506,50 @@ class Boundary:
         self.timed("target-reuse-readback", inspect)
         destination = f"{self.rclone_remote}:{self.bucket}/{self.prefix}"
         verified_keys = set()
-        if resume_plan is None:
+        required = {key: info for key, info in content.items() if key != root_key}
+        repository = {
+            "endpoint": self.client.meta.endpoint_url,
+            "bucket": self.bucket,
+            "prefix": self.prefix,
+        }
+        indexed = resume_plan is None and len(required) > MAX_ENTRIES
+        if resume_plan is not None:
+            pinned = pinned_document(Path(resume_plan), identifier(plan_digest), LIMIT)
+            indexed = pinned.get("version") == 2
+        children = None
+        if indexed:
+            if resume_plan is None:
+                plan = self.evidence / (name + ".plan.json")
+                pin = create_index(
+                    plan, release_id, str(sender), destination, repository, required
+                )
+                atomic_file(
+                    self.evidence / (name + ".submission.json"),
+                    canonical({"plan": plan.name, "blake3": pin}),
+                )
+            else:
+                plan, pin = Path(resume_plan), identifier(plan_digest)
+            children = validate_index(
+                plan, pin, release_id, str(sender), destination, repository, required
+            )
+            verified_keys = set(required) - {entry[0] for entry in missing}
+            if resume_plan is not None:
+                atomic_file(
+                    self.evidence / (name + ".resume.json"),
+                    canonical(
+                        {
+                            "plan": str(plan),
+                            "blake3": pin,
+                            "reused_planned_keys": len(verified_keys),
+                        }
+                    ),
+                )
+        elif resume_plan is None:
             plan, pin = self.plan(release_id, str(sender), destination, missing, name)
         else:
             plan = Path(resume_plan)
-            raw = plan.read_bytes()
             pin = identifier(plan_digest)
-            if digest(raw) != pin:
-                raise ValueError("transfer plan changed before resume")
-            document = json.loads(raw)
+            document = pinned_document(plan, pin, LIMIT)
             if (
                 set(document)
                 != {"version", "release_id", "source", "destination", "entries"}
@@ -547,12 +590,28 @@ class Boundary:
                     }
                 ),
             )
-        self.timed(
-            "upload",
-            lambda: self.execute(
-                plan, pin, interrupt_after, verified_keys=verified_keys
-            ),
-        )
+
+        def upload():
+            if children is None:
+                self.execute(plan, pin, interrupt_after, verified_keys=verified_keys)
+                return
+
+            def guard():
+                pinned_document(plan, pin, INDEX_BYTES)
+
+            for child, child_pin in children:
+                self.execute(
+                    child,
+                    child_pin,
+                    interrupt_after,
+                    verified_keys=verified_keys,
+                    guard=guard,
+                )
+            validate_index(
+                plan, pin, release_id, str(sender), destination, repository, required
+            )
+
+        self.timed("upload", upload)
 
         def target_check():
             for key, info in content.items():
@@ -560,6 +619,10 @@ class Boundary:
                     validate(self.get(key), info)
 
         self.timed("target-fresh-readback", target_check)
+        if children is not None:
+            validate_index(
+                plan, pin, release_id, str(sender), destination, repository, required
+            )
         status = self.timed(
             "publish-root-last",
             lambda: self.conditional(root_key, local_get(sender, root_key)),
@@ -578,6 +641,8 @@ class Boundary:
             "files": len(records),
             "bytes": sum(r[1] for r in records.values()),
             "plan_blake3": pin,
+            "plan_version": 2 if children is not None else 1,
+            "plan_count": len(children) if children is not None else 1,
         }
         self.receipt(name, receipt)
         return receipt

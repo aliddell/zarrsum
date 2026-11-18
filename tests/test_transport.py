@@ -1,6 +1,7 @@
 """Check the direct backend contract with real rclone and controlled child failures."""
 
 import os
+import shutil
 import subprocess
 import sys
 
@@ -8,7 +9,11 @@ import pytest
 
 from zarrsum.transport import RcloneTransport
 
-RCLONE = "/mnt/main0/home/aliddell/.bin/rclone"
+RCLONE = (
+    os.environ.get("ZARRSUM_TEST_RCLONE")
+    or shutil.which("rclone")
+    or "/mnt/main0/home/aliddell/.bin/rclone"
+)
 
 
 def test_exact_keys_and_existing_wrong_bytes(tmp_path):

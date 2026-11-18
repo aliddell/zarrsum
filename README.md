@@ -201,3 +201,24 @@ Its default is 3600 seconds. Use an explicit smaller value for bounded failure t
 An expired deadline stops and reaps the child process and fails the operation. It does
 not mark a partial remote release complete. This bound is separate from rclone's HTTP
 idle timeout and from the allocation time limit.
+
+### Bounded multi-plan pushes
+
+A push whose complete nonroot graph exceeds 10,000 entries now writes a version 2
+index at `push.plan.json`. The index pins the release ID, absolute sender root,
+destination, repository endpoint, ordered child hashes, and entry counts. Child plans
+live under `plans/<digest>.json` beside the index. Each child retains the 10,000-entry
+limit. The index permits at most 64 children and 64 KiB; each child permits at most
+32 MiB. The existing remote graph limit remains 10,000 declared files. This change
+permits those files plus their required manifests and registries. It does not provide
+100,000-file remote support.
+
+The child union must cover the exact required nonroot graph. Missing, duplicate, foreign,
+misordered, or changed entries fail validation before transfer. The root never enters a
+bulk plan. Publication still requires fresh verification of the complete target graph.
+An existing remote object must pass a fresh byte check before reuse.
+
+Resume uses the same `--resume-plan` and `--plan-digest` options as a single-plan push.
+Keep the index and its entire sibling `plans/` directory together. The digest identifies
+the index; the index identifies every child. An indexed retry preserves those bytes and
+skips content that passes the remote byte checks. Legacy version 1 plans remain supported.
