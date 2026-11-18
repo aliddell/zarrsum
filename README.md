@@ -222,3 +222,12 @@ Resume uses the same `--resume-plan` and `--plan-digest` options as a single-pla
 Keep the index and its entire sibling `plans/` directory together. The digest identifies
 the index; the index identifies every child. An indexed retry preserves those bytes and
 skips content that passes the remote byte checks. Legacy version 1 plans remain supported.
+
+
+### Prepare releases from candidate locations
+
+The experimental `zarrsum-release prepare` command selects a verified local cache or
+an accessible retained store. It accepts Hermes-shaped filesystem and S3 location records.
+It returns verified ordinary files and a receipt for a future job-submission adapter.
+See [LOCATIONS.md](LOCATIONS.md) for the reference format, access mapping, byte budget,
+URI proposal, and integration limits. This does not deploy a Katamari submission hook.

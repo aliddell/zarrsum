@@ -719,12 +719,15 @@ class Store:
 def main(argv=None):
     import sys
     supplied = sys.argv[1:] if argv is None else argv
+    if supplied and supplied[0] == "prepare":
+        from .location_cli import main as prepare_main
+        return prepare_main(supplied[1:])
     if supplied and supplied[0] in {"remote", "push", "fetch", "checkout", "pull"}:
         from .remote_cli import main as remote_main
         return remote_main(supplied)
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("remote", "push", "fetch", "checkout", "pull"):
+    for name in ("remote", "push", "fetch", "checkout", "pull", "prepare"):
         commands.add_parser(name, help="experimental verified remote workflow")
     publish = commands.add_parser("publish")
     publish.add_argument("store")
