@@ -194,7 +194,8 @@ It reads and verifies existing target content before reusing any key. It preserv
 original plan bytes and digest. Target readback and conditional root publication still run.
 A corrupt existing object causes refusal. The remote owner must restore or remove the
 identified corrupt object before retry. This command does not silently overwrite it.
-The 10,000-entry plan and 10,000-file remote graph limits remain unchanged.
+The 10,000-entry child-plan limit remains. Current remote graph and scratch budgets
+are specified below.
 
 `--transfer-timeout SECONDS` bounds each rclone subprocess, including probes and copies.
 Its default is 3600 seconds. Use an explicit smaller value for bounded failure tests.
@@ -209,9 +210,8 @@ index at `push.plan.json`. The index pins the release ID, absolute sender root,
 destination, repository endpoint, ordered child hashes, and entry counts. Child plans
 live under `plans/<digest>.json` beside the index. Each child retains the 10,000-entry
 limit. The index permits at most 64 children and 64 KiB; each child permits at most
-32 MiB. The existing remote graph limit remains 10,000 declared files. This change
-permits those files plus their required manifests and registries. It does not provide
-100,000-file remote support.
+32 MiB. Current remote graph limits appear below. The index separates the graph count from
+the per-child plan limit; it does not remove graph validation or scratch budgets.
 
 The child union must cover the exact required nonroot graph. Missing, duplicate, foreign,
 misordered, or changed entries fail validation before transfer. The root never enters a
@@ -231,3 +231,28 @@ an accessible retained store. It accepts Hermes-shaped filesystem and S3 locatio
 It returns verified ordinary files and a receipt for a future job-submission adapter.
 See [LOCATIONS.md](LOCATIONS.md) for the reference format, access mapping, byte budget,
 URI proposal, and integration limits. This does not deploy a Katamari submission hook.
+### Bounded remote graph validation
+
+The experimental remote graph reader now keeps expected membership, registry namespaces,
+file records, object identities, metadata cache, and missing-object indexes in a private
+SQLite scratch directory. It processes one manifest at a time. Registry validation and
+path generation iterate registry lines instead of building full Python ID lists. The
+release identity and object bytes do not change.
+
+The current declared-file cap is 200,000. This is a finite supported-input bound, not a
+performance claim. Each metadata or payload body retains its 32 MiB limit. Each graph
+workspace has an 8 MiB SQLite page cache, disabled mmap, disk temporary storage, and a
+2 GiB database limit. Decoded JSON and library memory are additional; RSS must be measured.
+Keep TMPDIR on private scratch with sufficient space. Workspace files are disposable and
+removed when the operation releases them. Host loss may require owned-scratch cleanup.
+
+Push and large fetch construct ordered child plans incrementally. Each child stays at
+10,000 entries; the index keeps its existing count and byte bounds. The validator checks
+strict global key order, expected content, and exact total coverage without retaining a
+whole-graph seen set. Fetch still admits only checked content and requires full graph
+verification before a verified checkout. Pinned push retries preserve their existing rules.
+
+Full subprocess commands and transfer results are recorded in `commands.jsonl` and
+`transfers.jsonl` in the evidence directory. Each has a 64 MiB limit. CLI JSON retains at
+most 256 preview records and includes full record counts. Do not treat the preview length
+as the number of processes or transfers. Transfer and destination byte checks are unchanged.

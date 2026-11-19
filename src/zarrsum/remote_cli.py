@@ -234,5 +234,14 @@ def main(argv=None):
                     transfers=boundary.transfers,
                     sdk_requests=boundary.requests,
                     commands=boundary.adapter.commands,
+                    command_count=getattr(
+                        boundary.adapter.commands,
+                        "count",
+                        len(boundary.adapter.commands),
+                    ),
+                    transfer_count=boundary.transfers.count,
+                    commands_jsonl="commands.jsonl",
+                    transfers_jsonl="transfers.jsonl",
+                    evidence_preview_limit=256,
                 )
             atomic_file(evidence / "result.json", canonical(output))

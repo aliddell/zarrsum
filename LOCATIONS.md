@@ -54,7 +54,10 @@ Reef URI interpretation follows the proposal in Hermes PR #209 at `641c640`:
 The Hermes PR is still under review. URI interpretation is isolated in one helper.
 HPC store URIs must contain absolute paths. Store format and content validation are
 independent of the URI scheme. The current implementation needs fanout-2 caches and
-uses the existing bounded remote graph validator. It does not raise its 10,000-file limit.
+uses the combined bounded remote graph validator. Its declared-file limit is 200,000.
+Graph membership and missing-content bookkeeping use disposable SQLite scratch. Each
+workspace retains an 8 MiB page cache and a 2 GiB database bound. Metadata bodies remain
+bounded at 32 MiB. Set TMPDIR to private scratch with sufficient free space.
 
 ## Prepare before starting the loader
 

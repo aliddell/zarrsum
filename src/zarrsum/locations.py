@@ -6,6 +6,8 @@ absolute-path proposal is under review. Callers supply the local storage platfor
 
 from __future__ import annotations
 
+from contextlib import closing
+
 import hashlib
 import json
 from pathlib import Path
@@ -18,6 +20,7 @@ from urllib.parse import urlsplit
 from botocore.exceptions import BotoCoreError, ClientError
 
 from .releases import Store, atomic_file, canonical, digest, identifier, member
+from .graph_index import Workspace
 from .remotes import (
     Aliases,
     Boundary,
@@ -156,80 +159,94 @@ def _cached(path, key, info):
     return True
 
 
-def _missing(content, cache):
-    return {key: info for key, info in content.items() if not _cached(cache, key, info)}
+def _missing(content, cache, workspace):
+    missing = workspace.table()
+    for key, info in content.items():
+        if not _cached(cache, key, info):
+            missing[key] = info
+    return missing
 
 
 def _cache_complete(cache, rid):
-    if (
-        not (cache / "releases" / rid).exists()
-        and not (cache / "releases" / rid).is_symlink()
-    ):
-        return False
-    try:
-        _, content, _ = graph(rid, lambda key: local_get(cache, key))
-    except FileNotFoundError:
-        return False
-    except (ValueError, OSError, KeyError, TypeError, AttributeError) as error:
-        raise CacheError("cache metadata needs explicit repair") from error
-    return not _missing(content, cache)
+    with closing(Workspace()) as workspace:
+        if (
+            not (cache / "releases" / rid).exists()
+            and not (cache / "releases" / rid).is_symlink()
+        ):
+            return False
+        try:
+            _, content, _ = graph(
+                rid, lambda key: local_get(cache, key), workspace=workspace
+            )
+        except FileNotFoundError:
+            return False
+        except (ValueError, OSError, KeyError, TypeError, AttributeError) as error:
+            raise CacheError("cache metadata needs explicit repair") from error
+        return all(_cached(cache, key, info) for key, info in content.items())
 
 
 def _local_fetch(value, rid, cache, local_platform, limit):
-    source = filesystem_root(value, local_platform)
+    with closing(Workspace()) as workspace:
+        source = filesystem_root(value, local_platform)
 
-    def read(key):
-        try:
-            return local_get(source, key)
-        except (ValueError, OSError) as error:
-            raise CandidateError(
-                "filesystem store is unavailable or incomplete"
-            ) from error
-
-    try:
-        _, content, _ = graph(rid, read)
-    except (ValueError, KeyError, TypeError) as error:
-        raise CandidateError("filesystem store has invalid release metadata") from error
-    missing = _missing(content, cache)
-    if sum(info[0] for info in missing.values()) > limit:
-        raise CandidateError("candidate exceeds the new-content byte budget")
-    root_key = "releases/" + rid
-    with tempfile.TemporaryDirectory(prefix=".prepare-", dir=cache.parent) as temporary:
-        staging = Path(temporary)
-        for key, info in missing.items():
-            data = read(key)
+        def read(key):
             try:
-                validate(data, info)
-            except ValueError as error:
-                raise CandidateError("filesystem store has corrupt content") from error
-            target = staging / key
-            target.parent.mkdir(parents=True, exist_ok=True)
-            atomic_file(target, data)
-        for key, info in content.items():
-            if key == root_key:
-                continue
-            if not _cached(cache, key, info):
-                data = local_get(staging, key)
-                validate(data, info)
-                target = cache / key
+                return local_get(source, key)
+            except (ValueError, OSError) as error:
+                raise CandidateError(
+                    "filesystem store is unavailable or incomplete"
+                ) from error
+
+        try:
+            _, content, _ = graph(rid, read, workspace=workspace)
+        except (ValueError, KeyError, TypeError) as error:
+            raise CandidateError(
+                "filesystem store has invalid release metadata"
+            ) from error
+        missing = _missing(content, cache, workspace)
+        if sum(info[0] for info in missing.values()) > limit:
+            raise CandidateError("candidate exceeds the new-content byte budget")
+        root_key = "releases/" + rid
+        with tempfile.TemporaryDirectory(
+            prefix=".prepare-", dir=cache.parent
+        ) as temporary:
+            staging = Path(temporary)
+            for key, info in missing.items():
+                data = read(key)
+                try:
+                    validate(data, info)
+                except ValueError as error:
+                    raise CandidateError(
+                        "filesystem store has corrupt content"
+                    ) from error
+                target = staging / key
                 target.parent.mkdir(parents=True, exist_ok=True)
+                atomic_file(target, data)
+            for key, info in content.items():
+                if key == root_key:
+                    continue
                 if not _cached(cache, key, info):
-                    atomic_file(target, data)
-        for key, info in content.items():
-            if key != root_key:
-                validate(local_get(cache, key), info)
-        if root_key in missing:
-            data = local_get(staging, root_key)
-            validate(data, content[root_key])
-            target = cache / root_key
-            target.parent.mkdir(parents=True, exist_ok=True)
-            atomic_file(target, data)
-    return {
-        "physical_root": str(source),
-        "downloaded_keys": len(missing),
-        "downloaded_bytes": sum(info[0] for info in missing.values()),
-        "cache_hits": len(content) - len(missing),
-    }
+                    data = local_get(staging, key)
+                    validate(data, info)
+                    target = cache / key
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if not _cached(cache, key, info):
+                        atomic_file(target, data)
+            for key, info in content.items():
+                if key != root_key:
+                    validate(local_get(cache, key), info)
+            if root_key in missing:
+                data = local_get(staging, root_key)
+                validate(data, content[root_key])
+                target = cache / root_key
+                target.parent.mkdir(parents=True, exist_ok=True)
+                atomic_file(target, data)
+        return {
+            "physical_root": str(source),
+            "downloaded_keys": len(missing),
+            "downloaded_bytes": sum(info[0] for info in missing.values()),
+            "cache_hits": len(content) - len(missing),
+        }
 
 
 def _s3_fetch(value, rid, cache, evidence, remotes, location_remotes, limit, options):
@@ -261,10 +278,11 @@ def _s3_fetch(value, rid, cache, evidence, remotes, location_remotes, limit, opt
         )
         version = transport.version()
         boundary.repository()
-        _, content, _ = graph(rid, boundary.get)
-        missing = _missing(content, cache)
-        if sum(info[0] for info in missing.values()) > limit:
-            raise CandidateError("candidate exceeds the new-content byte budget")
+        with closing(Workspace()) as workspace:
+            _, content, _ = graph(rid, boundary.get, workspace=workspace)
+            missing = _missing(content, cache, workspace)
+            if sum(info[0] for info in missing.values()) > limit:
+                raise CandidateError("candidate exceeds the new-content byte budget")
         result = boundary.fetch(rid, cache)
         return {**result, "access_alias": mapping[uri], "transport_version": version}
     except CacheError:
@@ -280,6 +298,11 @@ def _s3_fetch(value, rid, cache, evidence, remotes, location_remotes, limit, opt
                         "events": boundary.events,
                         "sdk_requests": boundary.requests,
                         "commands": boundary.adapter.commands,
+                        "command_count": boundary.adapter.commands.count,
+                        "transfer_count": boundary.transfers.count,
+                        "commands_jsonl": "commands.jsonl",
+                        "transfers_jsonl": "transfers.jsonl",
+                        "evidence_preview_limit": 256,
                     }
                 ),
             )
