@@ -27,9 +27,13 @@ class Transport(Protocol):
     ) -> TransferResult: ...
 
 
+MAX_BATCH_KEYS = 1024
+MAX_KEY_LIST_BYTES = 512 << 10
+
+
 def file_keys(keys):
-    if not keys or len(keys) > 256 or len(set(keys)) != len(keys):
-        raise ValueError("expected 1 to 256 distinct file keys")
+    if not keys or len(keys) > MAX_BATCH_KEYS:
+        raise ValueError("expected 1 to 1024 distinct file keys")
     for key in keys:
         if (
             not isinstance(key, str)
@@ -40,6 +44,10 @@ def file_keys(keys):
             or any(c in key for c in "\\\n\r\x00")
         ):
             raise ValueError("unsupported or unsafe file key")
+    if len(set(keys)) != len(keys):
+        raise ValueError("expected distinct file keys")
+    if sum(len(key.encode("utf-8")) + 1 for key in keys) > MAX_KEY_LIST_BYTES:
+        raise ValueError("encoded key list exceeds byte budget")
     return keys
 
 

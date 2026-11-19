@@ -76,6 +76,14 @@ def main(argv=None):
             )
         return seconds
 
+    def batch_keys(value):
+        number = int(value)
+        if not 1 <= number <= 1024:
+            raise argparse.ArgumentTypeError(
+                "transfer batch size must be between 1 and 1024"
+            )
+        return number
+
     parser = argparse.ArgumentParser(prog="zarrsum-release", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     remotes = sub.add_parser("remote")
@@ -115,6 +123,7 @@ def main(argv=None):
             item.add_argument("--rclone-config")
             item.add_argument("--bwlimit")
             item.add_argument("--transfer-timeout", type=timeout_seconds, default=3600)
+            item.add_argument("--transfer-batch-size", type=batch_keys, default=64)
     args = parser.parse_args(argv)
     evidence = None
     boundary = None
@@ -192,6 +201,7 @@ def main(argv=None):
                     bucket=config["bucket"],
                     rclone_remote=config["rclone_remote"],
                     transport=transport,
+                    batch_size=args.transfer_batch_size,
                 )
                 version = transport.version()
                 if args.command == "push":
@@ -213,6 +223,7 @@ def main(argv=None):
                             "release_id": args.release_id,
                         }
                 output["transport_version"] = version
+                output["transfer_batch_size"] = args.transfer_batch_size
         print(json.dumps(output, sort_keys=True))
         return 0
     except KeyboardInterrupt as error:

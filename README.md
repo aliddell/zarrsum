@@ -248,3 +248,25 @@ Full subprocess commands and transfer results are recorded in `commands.jsonl` a
 `transfers.jsonl` in the evidence directory. Each has a 64 MiB limit. CLI JSON retains at
 most 256 preview records and includes full record counts. Do not treat the preview length
 as the number of processes or transfers. Transfer and destination byte checks are unchanged.
+
+### Native transfer batch size
+
+`--transfer-batch-size N` selects 1 to 1,024 exact keys per native copy. The default
+remains 64. It does not change child-plan bytes, release identity, rclone concurrency,
+source/destination presence checks, target readback, or destination byte verification.
+The direct backend also limits the encoded file list to 512 KiB before starting rclone.
+Operation output records the selected batch size. For the tested small-file workflow,
+select 1,024 keys explicitly on `push`, `fetch`, or `pull`:
+
+```bash
+zarrsum-release push "$SENDER" "$RELEASE" --remote test --remotes remotes.json \
+  --evidence evidence/push --transfer-batch-size 1024
+```
+
+Use `--transfer-batch-size 64` to select the default size explicitly. The Bruno two-host
+test on 2026-11-19 used 100,000 unique 1 KiB files and two trials per size. Mean verified
+push time fell from 889 to 481 seconds. Mean cold pull time fell from 638 to 261 seconds.
+The runtime used base `66a0ec4` with the batch-control changes published here.
+The [test record](https://github.com/aliddell/data-versioning/blob/c5c9ab6/reference/2026-11-19-bruno-stall-diagnostic.md)
+contains source hashes and complete evidence. These measurements do not establish
+performance for other networks or file sizes.
