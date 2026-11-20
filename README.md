@@ -341,3 +341,10 @@ A complete-cache preparation does not load or execute rclone. Its empty fetch re
 does not claim a checked native pin. Offline checkout also needs no executable.
 `pull --ozx` uses the SDK only and refuses `--rclone-sha256`; its receipt does not
 claim rclone provenance. Binary checks do not change release IDs or byte verification.
+
+## Optional Hermes library adapter
+
+The experimental [Hermes file transport](HERMES.md) can replace the direct adapter
+through the Python boundary. It requires the reviewed file-only Hermes patch.
+It preserves exact keys, native pins, and release-layer BLAKE3 checks. The default
+installation and commands do not require Hermes. Managed Hermes jobs remain separate.

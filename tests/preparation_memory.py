@@ -31,6 +31,8 @@ def child(count):
             _, python_peak = tracemalloc.get_traced_memory()
             tracemalloc.stop()
             assert len(missing) == count
+            assert missing.workspace is workspace
+            assert sum(value[0] for value in missing.values()) == count
             assert python_peak < 4 << 20
             result = {
                 "entries": count,

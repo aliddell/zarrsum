@@ -447,32 +447,17 @@ def test_a_damaged_partial_cache_requires_repair_before_retry(published, tmp_pat
     assert path.read_bytes() == b"corrupt"
 
 
-def test_large_missing_inventory_bounds_python_allocation(tmp_path):
-    import tracemalloc
-    from zarrsum.graph_index import Workspace
-
-    class Content:
-        def items(self):
-            for number in range(100000):
-                value = f"{number:064x}"
-                yield f"objects/{value[:2]}/{value[2:4]}/{value}", [1, value]
-
-    workspace = Workspace()
-    scratch = Path(workspace.directory.name)
-    try:
-        tracemalloc.start()
-        missing = locations._missing(Content(), tmp_path / "empty-cache", workspace)
-        _, peak = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
-        assert len(missing) == 100000
-        assert peak < 4 << 20
-        assert missing.workspace is workspace
-        assert sum(value[0] for value in missing.values()) == 100000
-    finally:
-        if tracemalloc.is_tracing():
-            tracemalloc.stop()
-        workspace.close()
-    assert not scratch.exists()
+def test_large_missing_inventory_bounds_python_allocation():
+    """Keep unrelated optional-package allocations outside the measured process."""
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).with_name("preparation_memory.py")),
+         "--child", "100000"],
+        check=True, capture_output=True, text=True, timeout=120,
+    )
+    value = json.loads(result.stdout)
+    assert value["entries"] == 100000
+    assert value["python_peak_bytes"] < 4 << 20
+    assert value["scratch_removed"]
 
 
 def test_workspace_cleanup_after_candidate_failure(published, tmp_path, monkeypatch):

@@ -333,6 +333,8 @@ class Boundary:
         self.evidence = Path(evidence)
         self.evidence.mkdir(parents=True, exist_ok=True)
         self.adapter = transport or RcloneTransport(binary=binary, config=rconfig)
+        if batch_size > getattr(self.adapter, "max_batch_keys", MAX_BATCH_KEYS):
+            raise ValueError("transfer batch size exceeds the selected backend limit")
         self.events = []
         self.transfers = EvidenceLog(self.evidence / "transfers.jsonl")
         if hasattr(self.adapter, "commands"):

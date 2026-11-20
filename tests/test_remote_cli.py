@@ -85,8 +85,17 @@ def test_offline_checkout_preserves_existing_and_detects_change(tmp_path):
     assert (destination / "data").read_bytes() == b"CORRUPT"
 
 
-def test_environment_has_no_hermes():
-    code = "import importlib.util; assert importlib.util.find_spec('hermes_core') is None; import zarrsum.remote_cli"
+def test_default_import_needs_no_hermes():
+    code = """
+import importlib.abc
+import sys
+class AbsentHermes(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'hermes_core' or fullname.startswith('hermes_core.'):
+            raise AssertionError('Default import attempted to load Hermes')
+sys.meta_path.insert(0, AbsentHermes())
+import zarrsum.remote_cli
+"""
     subprocess.run([sys.executable, "-c", code], check=True)
 
 
