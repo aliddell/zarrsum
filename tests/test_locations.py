@@ -263,11 +263,9 @@ def test_invalid_or_unsupported_locations_are_rejected(platform, uri):
     "uri,expected",
     [
         ("reef://dataset", "/mnt/main0/projects/dataset"),
-        ("reef:///mnt/main0/home/user/store", "/mnt/main0/home/user/store"),
-        ("reef:///bio/projects/data", "/mnt/main0/projects/data"),
     ],
 )
-def test_reef_mapping_matches_the_reviewed_shared_volume_proposal(uri, expected):
+def test_reef_mapping_uses_the_projects_root(uri, expected):
     assert (
         str(filesystem_root({"storage_platform": "reef", "location_uri": uri}, "reef"))
         == expected
@@ -493,3 +491,49 @@ def test_workspace_cleanup_after_candidate_failure(published, tmp_path, monkeypa
         run(published, tmp_path)
     assert paths and not any(path.exists() for path in paths)
     assert not (tmp_path / "checkout").exists()
+
+
+@pytest.mark.parametrize("uri", ["reef:///mnt/main0/home/user/store", "reef:///bio/projects/data", "reef:///mnt/main0/projects/data"])
+def test_reef_absolute_paths_remain_unsupported(uri):
+    with pytest.raises(ValueError, match="projects-relative"):
+        location({"storage_platform": "reef", "location_uri": uri})
+
+
+def test_reef_symlink_cannot_escape_projects(monkeypatch):
+    monkeypatch.setattr(Path, "resolve", lambda self: Path("/mnt/main0/home/user/store"))
+    with pytest.raises(ValueError, match="projects root"):
+        filesystem_root({"storage_platform": "reef", "location_uri": "reef://fixture/store"}, "reef")
+
+
+@pytest.mark.parametrize("batch", [0, 1025, True, 1.5])
+def test_prepare_rejects_invalid_batch_before_creating_paths(tmp_path, batch):
+    with pytest.raises(ValueError, match="batch size"):
+        prepare({}, tmp_path/"cache", tmp_path/"checkout", tmp_path/"evidence", transfer_batch_size=batch)
+    assert not list(tmp_path.iterdir())
+
+
+def test_s3_prepare_forwards_batch_to_boundary_not_connection(tmp_path, monkeypatch):
+    mapping = tmp_path / "mapping.json"
+    mapping.write_text(json.dumps({"s3://bucket/root": "fixture"}))
+    monkeypatch.setattr(locations, "Aliases", lambda path: SimpleNamespace(
+        list=lambda: {"fixture": {"bucket": "bucket", "prefix": "root", "rclone_remote": "s3"}}))
+    monkeypatch.setattr(locations, "remote_config", lambda value: value)
+    from zarrsum import remote_cli
+
+    seen = {}
+
+    def connection(config, **options):
+        assert "transfer_batch_size" not in options
+        return object(), object(), "rclone.conf"
+
+    def boundary(*args, **kwargs):
+        seen.update(kwargs)
+        raise RuntimeError("boundary captured")
+
+    monkeypatch.setattr(remote_cli, "connection", connection)
+    monkeypatch.setattr(locations, "Boundary", boundary)
+    with pytest.raises(RuntimeError, match="boundary captured"):
+        locations._s3_fetch({"location_uri": "s3://bucket/root"}, "0"*64,
+            tmp_path/"cache", tmp_path/"evidence", tmp_path/"remotes", mapping,
+            1024, {"transfer_batch_size": 1024})
+    assert seen["batch_size"] == 1024

@@ -24,6 +24,7 @@ def main(argv=None):
     parser.add_argument("--rclone-binary", default="rclone")
     parser.add_argument("--transfer-timeout", type=float, default=3600)
     parser.add_argument("--max-fetch-bytes", type=int, default=MAX_FETCH_BYTES)
+    parser.add_argument("--transfer-batch-size", type=int, default=64)
     args = parser.parse_args(argv)
     import math
 
@@ -32,6 +33,9 @@ def main(argv=None):
         or not 0 < args.transfer_timeout <= 3600
     ):
         parser.error("transfer timeout must be finite and between 0 and 3600 seconds")
+
+    if not 1 <= args.transfer_batch_size <= 1024:
+        parser.error("transfer batch size must be between 1 and 1024")
 
     def interrupted(_signal, _frame):
         raise KeyboardInterrupt("preparation interrupted")
@@ -49,6 +53,7 @@ def main(argv=None):
             max_fetch_bytes=args.max_fetch_bytes,
             binary=args.rclone_binary,
             timeout=args.transfer_timeout,
+            transfer_batch_size=args.transfer_batch_size,
         )
     except KeyboardInterrupt:
         parser.exit(130, "computed-release: preparation interrupted\n")

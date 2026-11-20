@@ -1,7 +1,6 @@
 """Resolve retained release stores without making their locations part of identity.
 
-Location records follow Hermes. URI interpretation stays in one helper while its
-absolute-path proposal is under review. Callers supply the local storage platform.
+Location records follow Hermes. Portable Reef locations stay under the shared projects root. Callers supply the local storage platform.
 """
 
 from __future__ import annotations
@@ -98,12 +97,13 @@ def location(value):
         member(parsed.path[1:].rstrip("/"))
     else:
         if platform == "reef":
-            path = rest if rest.startswith("/") else "/mnt/main0/projects/" + rest
-            if path == "/bio/projects" or path.startswith("/bio/projects/"):
-                path = "/mnt/main0/projects" + path[len("/bio/projects") :]
+            if rest.startswith("/"):
+                raise ValueError("use the portable reef:// projects-relative form")
+            member(rest.rstrip("/"))
+            path = "/mnt/main0/projects/" + rest
             normalized = posixpath.normpath(path)
-            if normalized != "/mnt/main0" and not normalized.startswith("/mnt/main0/"):
-                raise ValueError("Reef store must remain on /mnt/main0")
+            if not normalized.startswith("/mnt/main0/projects/"):
+                raise ValueError("Reef store must remain under the projects root")
         elif not rest.startswith("/"):
             raise ValueError("HPC release stores need absolute paths")
     return {
@@ -123,8 +123,8 @@ def filesystem_root(value, local_platform):
         if rest == "/bio/projects" or rest.startswith("/bio/projects/"):
             rest = "/mnt/main0/projects" + rest[len("/bio/projects") :]
     path = Path(rest).resolve()
-    if platform == "reef" and not path.is_relative_to("/mnt/main0"):
-        raise CandidateError("Reef store resolves outside the shared volume")
+    if platform == "reef" and not path.is_relative_to("/mnt/main0/projects"):
+        raise CandidateError("Reef store resolves outside the projects root")
     return path
 
 
@@ -266,6 +266,8 @@ def _s3_fetch(value, rid, cache, evidence, remotes, location_remotes, limit, opt
 
     boundary = None
     try:
+        options = dict(options)
+        batch_size = options.pop("transfer_batch_size", 64)
         client, transport, path = connection(config, **options)
         boundary = Boundary(
             client,
@@ -275,6 +277,7 @@ def _s3_fetch(value, rid, cache, evidence, remotes, location_remotes, limit, opt
             bucket=config["bucket"],
             rclone_remote=config["rclone_remote"],
             transport=transport,
+            batch_size=batch_size,
         )
         version = transport.version()
         boundary.repository()
@@ -284,7 +287,8 @@ def _s3_fetch(value, rid, cache, evidence, remotes, location_remotes, limit, opt
             if sum(info[0] for info in missing.values()) > limit:
                 raise CandidateError("candidate exceeds the new-content byte budget")
         result = boundary.fetch(rid, cache)
-        return {**result, "access_alias": mapping[uri], "transport_version": version}
+        return {**result, "access_alias": mapping[uri], "transport_version": version,
+                "transfer_batch_size": batch_size}
     except CacheError:
         raise
     except (BotoCoreError, ClientError, ValueError) as error:
@@ -318,6 +322,7 @@ def prepare(
     remotes=None,
     location_remotes=None,
     max_fetch_bytes=MAX_FETCH_BYTES,
+    transfer_batch_size=64,
     **transport_options,
 ):
     """Return verified local paths and provenance for a submission adapter.
@@ -325,6 +330,9 @@ def prepare(
     The owner supplies a cooperative cache. Invalid cache bytes require explicit repair.
     Failed candidates never expose a checkout. No credentials are loaded for a cache hit.
     """
+    if type(transfer_batch_size) is not int or not 1 <= transfer_batch_size <= 1024:
+        raise ValueError("transfer batch size must be between 1 and 1024")
+    transport_options["transfer_batch_size"] = transfer_batch_size
     value = reference(value)
     if local_platform is not None and local_platform not in LOCAL_PLATFORMS:
         raise ValueError("unsupported local platform")
@@ -412,6 +420,7 @@ def prepare(
             "reference": value,
             "local_platform": local_platform,
             "max_fetch_bytes": max_fetch_bytes,
+            "transfer_batch_size": transfer_batch_size,
             "cache_hit": complete,
             "selected_location": selected,
             "fetch": fetched,

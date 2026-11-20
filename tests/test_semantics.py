@@ -149,8 +149,9 @@ def test_inventory_sees_same_size_rewrite_via_mtime():
         chunk = os.path.join(s, "a", "0.0")
         inv1 = zarrsum.hash_dataset(s, policy="inventory")["dataset_id"]
         m1 = os.stat(chunk).st_mtime_ns
-        with open(chunk, "wb") as f:  # same size (16), new bytes -> mtime bumps
+        with open(chunk, "wb") as f:
             f.write(b"\x02" * 16)
+        os.utime(chunk, ns=(m1 + 1_000_000_000, m1 + 1_000_000_000))
         inv2 = zarrsum.hash_dataset(s, policy="inventory")["dataset_id"]
         assert inv2 != inv1, "inventory must see a same-size rewrite (mtime bumped)"
         # the remaining blind spot: new bytes, same size, mtime restored to inv1's value

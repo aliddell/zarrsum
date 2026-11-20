@@ -16,7 +16,7 @@ No Hermes package, service, DynamoDB table, or Catalog lookup is required.
   "locations": [
     {
       "storage_platform": "reef",
-      "location_uri": "reef:///mnt/main0/home/publisher/release-store"
+      "location_uri": "reef://publisher/release-store"
     },
     {
       "storage_platform": "sf_hpc",
@@ -44,14 +44,13 @@ which filesystem platform is local. A location on another platform is skipped wi
 attempting to read its filesystem. These schemes do not establish SSH connections.
 Direct Bruno-to-Reef transfer still needs a supported route or a separately staged copy.
 
-Reef URI interpretation follows the proposal in Hermes PR #209 at `641c640`:
+Reef URI interpretation uses the approved projects-root policy:
 
 - `reef://dataset/store` maps under `/mnt/main0/projects/dataset/store`.
-- `reef:///mnt/main0/home/publisher/store` keeps its absolute path.
-- `/bio/projects` aliases map to `/mnt/main0/projects`.
-- The resolved path must remain on `/mnt/main0`, including symlink resolution.
+- Three-slash absolute Reef forms are not supported.
+- The resolved path must remain under `/mnt/main0/projects`, including symlink resolution.
+- Keep home and scratch paths in job-local configuration.
 
-The Hermes PR is still under review. URI interpretation is isolated in one helper.
 HPC store URIs must contain absolute paths. Store format and content validation are
 independent of the URI scheme. The current implementation needs fanout-2 caches and
 uses the combined bounded remote graph validator. Its declared-file limit is 200,000.
@@ -146,3 +145,15 @@ This interface does not yet patch production Katamari or Damacy submission. The 
 bounded launcher adapter demonstrates the path mapping on HPA inputs. Multi-node preparation,
 cache concurrency, access authorization, retention ownership, and production orchestration
 need separate integration. A publisher must preserve at least one accessible retained copy.
+
+
+## Native transfer batch size
+
+`prepare --transfer-batch-size 1024` selects the tested larger small-file batch.
+Python callers pass `transfer_batch_size=1024`. The default stays 64. Values must
+be integers from 1 through 1024. The selected value reaches the S3 transfer
+boundary and appears in the preparation receipt. The 512 KiB encoded-list bound,
+plan identity, cache admission, and fresh byte checks remain unchanged.
+
+Portable Reef references use the projects-relative form only. Job-local cache,
+checkout, and evidence paths remain ordinary local configuration.

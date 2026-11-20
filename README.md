@@ -11,14 +11,12 @@ changed, and the manifest can pin a whole store or a subset of its arrays.
 
 - A **BLAKE3 Merkle tree**: chunk -> array -> group -> store, then a dataset id that
   combines the store ids with the non-Zarr files.
-- **Two leaf policies.** `bytes` (default) hashes every data-file's bytes — always sound,
-  but it reads everything. `inventory` hashes a data-file's **`(size, mtime)`** (a stat, no
-  byte read) — near-free at PB scale. An in-place rewrite bumps the mtime, so it is seen; the
-  id is blind only to a rewrite that keeps *both* the size and the mtime (which needs the
-  mtime deliberately preserved). Metadata and non-Zarr files are always hashed in full under
-  both policies, so a metadata edit is always caught. The policy is named in the id's format
-  version (`zarrsum-id/1` vs `zarrsum-inv/2`), so the two never look alike. For transfer or
-  corruption QC (bit-rot keeps the same size and mtime), use the `bytes` policy.
+- **Two leaf policies.** `bytes` reads and hashes every payload byte. It requires a
+  stable source. `inventory` records the size and mtime of each payload file. It still
+  requires enumeration and file stats. It can miss an edit that preserves both fields.
+  Storage corruption can also preserve them. Metadata and non-Zarr files are hashed
+  in full under both policies. The formats differ: `zarrsum-id/1` and `zarrsum-inv/2`.
+  Use the bytes policy for fresh content verification.
 - **Zarr-aware**: it reads the key encoding from the array metadata, so it handles Zarr v2
   and the Zarr v3 `c/0/0/0` default. The leaf of the tree is a **data file**: for an
   unsharded array that is one chunk; for a sharded Zarr v3 array that is one shard (which
@@ -256,3 +254,54 @@ Full subprocess commands and transfer results are recorded in `commands.jsonl` a
 `transfers.jsonl` in the evidence directory. Each has a 64 MiB limit. CLI JSON retains at
 most 256 preview records and includes full record counts. Do not treat the preview length
 as the number of processes or transfers. Transfer and destination byte checks are unchanged.
+
+### Native transfer batch size
+
+`--transfer-batch-size N` selects 1 to 1,024 exact keys per native copy. The default
+remains 64. It does not change child-plan bytes, release identity, rclone concurrency,
+source/destination presence checks, target readback, or destination byte verification.
+The direct backend also limits the encoded file list to 512 KiB before starting rclone.
+Operation output records the selected batch size. For the tested small-file workflow,
+select 1,024 keys explicitly on `push`, `fetch`, or `pull`:
+
+```bash
+zarrsum-release push "$SENDER" "$RELEASE" --remote test --remotes remotes.json \
+  --evidence evidence/push --transfer-batch-size 1024
+```
+
+Use `--transfer-batch-size 64` to select the default size explicitly. The Bruno two-host
+test on 2026-11-19 used 100,000 unique 1 KiB files and two trials per size. Mean verified
+push time fell from 889 to 481 seconds. Mean cold pull time fell from 638 to 261 seconds.
+The runtime used base `66a0ec4` with the batch-control changes published here.
+The [test record](https://github.com/aliddell/data-versioning/blob/c5c9ab6/reference/2026-11-19-bruno-stall-diagnostic.md)
+contains source hashes and complete evidence. These measurements do not establish
+performance for other networks or file sizes.
+
+## Experimental release references and submitted jobs
+
+[REFERENCE-POC.md](REFERENCE-POC.md) describes six explicit registration strategies.
+They separate full hashing, imported producer digests, version assertions, and sampling.
+The new interface does not change the existing transfer verification defaults.
+
+The optional `metadata_releases`, `catalog_releases`, and `submissions` modules support
+owned integration tests. They preserve metadata revisions and exact job inputs.
+Catalog tests use the pinned external client and an HTTP test transport. Submission
+tests use a durable journal and refuse automatic resubmission after uncertain dispatch.
+The examples name Reef fixture resources. Production deployment and a storage retention
+agreement remain separate work. The optional catalog modules do not add dependencies
+to the reference registration CLI.
+
+## Experimental direct OZX output
+
+`zarrsum-release pull --ozx RELEASE_ID DESTINATION --remote ALIAS --remotes CONFIG
+--evidence DIRECTORY` writes a verified stored ZIP archive. It uses ZIP64 when needed.
+The command reads the exact remote release and checks all declared payload bytes.
+It creates no local payload cache or unpacked checkout. Existing output is preserved.
+Incomplete downloads do not publish an archive. `--workers` selects one to eight SDK
+read workers. Native `--transfer-batch-size` applies to directory transfers.
+
+The graph limit remains 200,000 declared files. Each payload object remains limited to
+32 MiB. The archive writer keeps a ZIP member index in memory. Metadata edits inside
+an archive require a new archive. The tested archive-aware helpers can read OZX inputs.
+The earlier Katamari v2 metadata builder and reader require separate archive-path work.
+This command does not establish full Katamari OZX training support.

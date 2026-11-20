@@ -16,10 +16,11 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+from threading import Lock
 import time
 
 from botocore.exceptions import ClientError
-from .transport import RcloneTransport
+from .transport import RcloneTransport, MAX_BATCH_KEYS
 from .graph_index import Workspace, WithoutRoot, VerifiedKeys, EvidenceLog
 from .transfer_plans import (
     create_index,
@@ -306,7 +307,11 @@ class Boundary:
         rclone_remote="s3",
         binary="rclone",
         transport=None,
+        batch_size=64,
     ):
+        if type(batch_size) is not int or not 1 <= batch_size <= MAX_BATCH_KEYS:
+            raise ValueError("transfer batch size must be between 1 and 1024")
+        self.batch_size = batch_size
         endpoint = endpoint_url(client.meta.endpoint_url)
         if allowed_endpoints is not None:
             fixture_endpoint(endpoint, allowed_endpoints)
@@ -333,10 +338,12 @@ class Boundary:
         if hasattr(self.adapter, "commands"):
             self.adapter.commands = EvidenceLog(self.evidence / "commands.jsonl")
         self.requests = {}
+        request_lock = Lock()
 
         def count(model, **_):
             name = model.name
-            self.requests[name] = self.requests.get(name, 0) + 1
+            with request_lock:
+                self.requests[name] = self.requests.get(name, 0) + 1
 
         client.meta.events.register("before-call.s3", count)
 
@@ -348,6 +355,8 @@ class Boundary:
             "releases": Path(__file__).with_name("releases.py"),
             "direct_rclone": Path(transport.__file__),
         }
+        if value.get("packaging", {}).get("format") == "ozx":
+            sources["ozx"] = Path(__file__).with_name("ozx.py")
         value.update(
             utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             repository={
@@ -449,13 +458,13 @@ class Boundary:
     ):
         plan = pinned_document(path, pinned, LIMIT)
         entries = plan["entries"]
-        for offset in range(0, len(entries), 64):
+        for offset in range(0, len(entries), self.batch_size):
             if guard is not None:
                 guard()
             pinned_bytes(path, pinned, LIMIT)
             batch = [
                 checked(e[0])
-                for e in entries[offset : offset + 64]
+                for e in entries[offset : offset + self.batch_size]
                 if e[0] not in verified_keys
             ]
             if not batch:
@@ -471,7 +480,10 @@ class Boundary:
             )
             if not result.ok:
                 raise ValueError("rclone file transfer failed: " + result.detail)
-            if interrupt_after is not None and offset // 64 + 1 >= interrupt_after:
+            if (
+                interrupt_after is not None
+                and offset // self.batch_size + 1 >= interrupt_after
+            ):
                 raise InterruptedError(
                     "injected coordinator interruption after completed batch"
                 )
