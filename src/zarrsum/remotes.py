@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+from threading import Lock
 import time
 
 from botocore.exceptions import ClientError
@@ -337,10 +338,12 @@ class Boundary:
         if hasattr(self.adapter, "commands"):
             self.adapter.commands = EvidenceLog(self.evidence / "commands.jsonl")
         self.requests = {}
+        request_lock = Lock()
 
         def count(model, **_):
             name = model.name
-            self.requests[name] = self.requests.get(name, 0) + 1
+            with request_lock:
+                self.requests[name] = self.requests.get(name, 0) + 1
 
         client.meta.events.register("before-call.s3", count)
 
@@ -352,6 +355,8 @@ class Boundary:
             "releases": Path(__file__).with_name("releases.py"),
             "direct_rclone": Path(transport.__file__),
         }
+        if value.get("packaging", {}).get("format") == "ozx":
+            sources["ozx"] = Path(__file__).with_name("ozx.py")
         value.update(
             utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             repository={

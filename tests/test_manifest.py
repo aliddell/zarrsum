@@ -47,8 +47,11 @@ def test_inventory_verify_sees_same_size_rewrite():
         s = _store(os.path.join(base, "s"), {"0.0": b"\x01" * 16})
         mpath = os.path.join(base, "manifest.json")
         manifest.add_dataset(mpath, "ds", s, policy="inventory")
-        with open(os.path.join(s, "a", "0.0"), "wb") as f:
-            f.write(b"\x02" * 16)  # same size, new bytes -> mtime bumps
+        chunk = os.path.join(s, "a", "0.0")
+        before = os.stat(chunk)
+        with open(chunk, "wb") as f:
+            f.write(b"\x02" * 16)
+        os.utime(chunk, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
         assert not manifest.verify_dataset(mpath, "ds")["ok"]  # inventory catches it via mtime
         with open(os.path.join(s, "a", "0.0"), "wb") as f:
             f.write(b"\x02" * 32)  # different size

@@ -11,14 +11,12 @@ changed, and the manifest can pin a whole store or a subset of its arrays.
 
 - A **BLAKE3 Merkle tree**: chunk -> array -> group -> store, then a dataset id that
   combines the store ids with the non-Zarr files.
-- **Two leaf policies.** `bytes` (default) hashes every data-file's bytes — always sound,
-  but it reads everything. `inventory` hashes a data-file's **`(size, mtime)`** (a stat, no
-  byte read) — near-free at PB scale. An in-place rewrite bumps the mtime, so it is seen; the
-  id is blind only to a rewrite that keeps *both* the size and the mtime (which needs the
-  mtime deliberately preserved). Metadata and non-Zarr files are always hashed in full under
-  both policies, so a metadata edit is always caught. The policy is named in the id's format
-  version (`zarrsum-id/1` vs `zarrsum-inv/2`), so the two never look alike. For transfer or
-  corruption QC (bit-rot keeps the same size and mtime), use the `bytes` policy.
+- **Two leaf policies.** `bytes` reads and hashes every payload byte. It requires a
+  stable source. `inventory` records the size and mtime of each payload file. It still
+  requires enumeration and file stats. It can miss an edit that preserves both fields.
+  Storage corruption can also preserve them. Metadata and non-Zarr files are hashed
+  in full under both policies. The formats differ: `zarrsum-id/1` and `zarrsum-inv/2`.
+  Use the bytes policy for fresh content verification.
 - **Zarr-aware**: it reads the key encoding from the array metadata, so it handles Zarr v2
   and the Zarr v3 `c/0/0/0` default. The leaf of the tree is a **data file**: for an
   unsharded array that is one chunk; for a sharded Zarr v3 array that is one shard (which
@@ -223,6 +221,14 @@ Keep the index and its entire sibling `plans/` directory together. The digest id
 the index; the index identifies every child. An indexed retry preserves those bytes and
 skips content that passes the remote byte checks. Legacy version 1 plans remain supported.
 
+
+### Prepare releases from candidate locations
+
+The experimental `zarrsum-release prepare` command selects a verified local cache or
+an accessible retained store. It accepts Hermes-shaped filesystem and S3 location records.
+It returns verified ordinary files and a receipt for a future job-submission adapter.
+See [LOCATIONS.md](LOCATIONS.md) for the reference format, access mapping, byte budget,
+URI proposal, and integration limits. This does not deploy a Katamari submission hook.
 ### Bounded remote graph validation
 
 The experimental remote graph reader now keeps expected membership, registry namespaces,
@@ -270,3 +276,41 @@ The runtime used base `66a0ec4` with the batch-control changes published here.
 The [test record](https://github.com/aliddell/data-versioning/blob/c5c9ab6/reference/2026-11-19-bruno-stall-diagnostic.md)
 contains source hashes and complete evidence. These measurements do not establish
 performance for other networks or file sizes.
+
+## Experimental release references and submitted jobs
+
+[REFERENCE-POC.md](REFERENCE-POC.md) describes six explicit registration strategies.
+They separate full hashing, imported producer digests, version assertions, and sampling.
+The new interface does not change the existing transfer verification defaults.
+
+The optional `metadata_releases`, `catalog_releases`, and `submissions` modules support
+owned integration tests. They preserve metadata revisions and exact job inputs.
+Catalog tests use the pinned external client and an HTTP test transport. Submission
+tests use a durable journal and refuse automatic resubmission after uncertain dispatch.
+The examples name Reef fixture resources. Production deployment and a storage retention
+agreement remain separate work. The optional catalog modules do not add dependencies
+to the reference registration CLI.
+
+## Experimental direct OZX output
+
+`zarrsum-release pull --ozx RELEASE_ID DESTINATION --remote ALIAS --remotes CONFIG
+--evidence DIRECTORY` writes a verified stored ZIP archive. It uses ZIP64 when needed.
+The command reads the exact remote release and checks all declared payload bytes.
+It creates no local payload cache or unpacked checkout. Existing output is preserved.
+Incomplete downloads do not publish an archive. `--workers` selects one to eight SDK
+read workers. Native `--transfer-batch-size` applies to directory transfers.
+
+The graph limit remains 200,000 declared files. Each payload object remains limited to
+32 MiB. The archive writer keeps a ZIP member index in memory. Metadata edits inside
+an archive require a new archive. The tested archive-aware helpers can read OZX inputs.
+The earlier Katamari v2 metadata builder and reader require separate archive-path work.
+This command does not establish full Katamari OZX training support.
+
+## Experimental shared reference workflow
+
+`zarrsum-reference` publishes release documents to a shared filesystem, registers their
+exact IDs with the Scientific Dataset Catalog, lists versions, freezes a resolution,
+and prepares separate metadata with hard-linked payloads. See [REFERENCE-WORKFLOW.md](REFERENCE-WORKFLOW.md).
+The catalog client and remote extra are required. Tests use an owned HTTP catalog
+fixture. Filesystem preparation requires a mounted candidate on the checkout filesystem.
+It does not add S3 payload recovery or managed Hermes submission to this reference format.

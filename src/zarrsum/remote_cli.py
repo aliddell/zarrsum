@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import sys
 import time
 
 from .releases import atomic_file, canonical, identifier
@@ -108,7 +109,18 @@ def main(argv=None):
     remove.add_argument("name")
     for command in ("push", "fetch", "pull", "checkout"):
         item = sub.add_parser(command)
-        item.add_argument("store")
+        if command == "pull":
+            pull = item
+            item.add_argument("store", nargs="?", help="local store for a directory pull")
+            item.add_argument(
+                "--ozx", action="store_true", help="write one OZX without a local store"
+            )
+            item.add_argument(
+                "--workers", type=int, choices=range(1, 9),
+                help="OZX download workers (default: 4)",
+            )
+        else:
+            item.add_argument("store")
         item.add_argument("release_id")
         item.add_argument("--evidence", required=True)
         if command == "push":
@@ -124,7 +136,21 @@ def main(argv=None):
             item.add_argument("--bwlimit")
             item.add_argument("--transfer-timeout", type=timeout_seconds, default=3600)
             item.add_argument("--transfer-batch-size", type=batch_keys, default=64)
-    args = parser.parse_args(argv)
+    supplied = sys.argv[1:] if argv is None else argv
+    if supplied and supplied[0] == "pull":
+        args = pull.parse_intermixed_args(
+            supplied[1:], namespace=argparse.Namespace(command="pull")
+        )
+    else:
+        args = parser.parse_args(supplied)
+    direct_ozx = args.command == "pull" and args.ozx
+    if args.command == "pull":
+        if direct_ozx and args.store is not None:
+            parser.error("pull --ozx takes RELEASE_ID DESTINATION without STORE")
+        if not direct_ozx and args.store is None:
+            parser.error("pull requires STORE RELEASE_ID DESTINATION unless --ozx is set")
+        if not direct_ozx and args.workers is not None:
+            parser.error("pull --workers requires --ozx")
     evidence = None
     boundary = None
     output = {"result": "failed", "command": args.command}
@@ -203,8 +229,23 @@ def main(argv=None):
                     transport=transport,
                     batch_size=args.transfer_batch_size,
                 )
-                version = transport.version()
-                if args.command == "push":
+                if not direct_ozx:
+                    version = transport.version()
+                if direct_ozx:
+                    from .ozx import write_ozx
+
+                    boundary.repository()
+                    output = boundary.timed(
+                        "write-ozx",
+                        lambda: write_ozx(
+                            args.release_id,
+                            boundary.get,
+                            args.destination,
+                            workers=args.workers or 4,
+                        ),
+                    )
+                    boundary.receipt("pull-ozx", output)
+                elif args.command == "push":
                     output = boundary.push(
                         args.store,
                         args.release_id,
@@ -222,8 +263,9 @@ def main(argv=None):
                             "result": "verified",
                             "release_id": args.release_id,
                         }
-                output["transport_version"] = version
-                output["transfer_batch_size"] = args.transfer_batch_size
+                if not direct_ozx:
+                    output["transport_version"] = version
+                    output["transfer_batch_size"] = args.transfer_batch_size
         print(json.dumps(output, sort_keys=True))
         return 0
     except KeyboardInterrupt as error:

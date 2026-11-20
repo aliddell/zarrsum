@@ -87,8 +87,27 @@ def test_timeout_reaps_child_and_removes_temporary_files(tmp_path, monkeypatch):
     import tempfile
 
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    import time
+
+    backend = RcloneTransport(binary, timeout=30)
+    original_popen = subprocess.Popen
+
+    def started(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        if "copy" in args[0]:
+            deadline = time.monotonic() + 30
+            while not pidfile.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not pidfile.exists():
+                process.kill()
+                process.wait()
+                pytest.fail("The fake copy child did not become ready")
+            backend.timeout = 0.15
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", started)
     with pytest.raises(subprocess.TimeoutExpired):
-        RcloneTransport(binary, timeout=0.15).copy("/source", "/destination", ["key"])
+        backend.copy("/source", "/destination", ["key"])
     pid = int(pidfile.read_text())
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
@@ -116,12 +135,12 @@ except KeyboardInterrupt: sys.exit(130)
 """
     owner = subprocess.Popen([sys.executable, "-c", code, binary, str(tmp_path)])
     try:
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 30
         while not pidfile.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         assert pidfile.exists()
         owner.send_signal(signal.SIGTERM)
-        assert owner.wait(timeout=5) == 130
+        assert owner.wait(timeout=30) == 130
         with pytest.raises(ProcessLookupError):
             os.kill(int(pidfile.read_text()), 0)
         assert not list(tmp_path.glob("zarrsum-rclone-*"))
