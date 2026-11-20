@@ -305,3 +305,12 @@ The graph limit remains 200,000 declared files. Each payload object remains limi
 an archive require a new archive. The tested archive-aware helpers can read OZX inputs.
 The earlier Katamari v2 metadata builder and reader require separate archive-path work.
 This command does not establish full Katamari OZX training support.
+
+## Experimental shared reference workflow
+
+`zarrsum-reference` publishes release documents to a shared filesystem, registers their
+exact IDs with the Scientific Dataset Catalog, lists versions, freezes a resolution,
+and prepares separate metadata with hard-linked payloads. See [REFERENCE-WORKFLOW.md](REFERENCE-WORKFLOW.md).
+The catalog client and remote extra are required. Tests use an owned HTTP catalog
+fixture. Filesystem preparation requires a mounted candidate on the checkout filesystem.
+It does not add S3 payload recovery or managed Hermes submission to this reference format.
