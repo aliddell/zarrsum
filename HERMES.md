@@ -58,3 +58,10 @@ throughput comparison. A managed backend should choose its job granularity separ
 No `--transport hermes` command or managed job interface is exposed. Those need the
 separate service contract for exact plan binding, request reconciliation, worker
 identity, access, and cancellation. Existing strong verification remains enabled.
+
+## Managed submission experiment
+
+[MANAGED-TRANSFERS.md](MANAGED-TRANSFERS.md) specifies a separate injected-service
+experiment for durable intent, exact job reconciliation, cancellation fences, and
+bound worker receipts. Its tests use a fake service and local fixture bytes. It has
+no deployed Hermes client and does not enable a managed transport in `Boundary`.
