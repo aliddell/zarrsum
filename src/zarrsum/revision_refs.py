@@ -20,7 +20,7 @@ from blake3 import blake3
 
 FORMAT = 'release-reference/experimental-1'
 MODES = ('full', 'producer-digest', 'immutable-reference', 'producer-revision',
-         'header-footer', 'random-blocks')
+         'header-footer', 'random-blocks', 'size-mtime')
 MAX_MEMBERS = 10_000
 MAX_DOCUMENT = 16 << 20
 BLOCK = 64 << 10
@@ -150,8 +150,8 @@ def register(spec, mode, root=None, *, seed=None):
     validate_spec(spec)
     if mode not in MODES:
         raise ValueError('Unknown registration mode')
-    if mode in ('full', 'header-footer', 'random-blocks') and root is None:
-        raise ValueError('This mode requires payload reads')
+    if mode in ('full', 'header-footer', 'random-blocks', 'size-mtime') and root is None:
+        raise ValueError('This mode requires a payload source')
     seed = seed or secrets.token_hex(16)
     text(seed)
     entries = []
@@ -169,6 +169,12 @@ def register(spec, mode, root=None, *, seed=None):
                 entry['blake3'] = fingerprint
             else:
                 entry.update(ranges=selected, fingerprint_blake3=fingerprint)
+        elif mode == 'size-mtime':
+            with open_member(root, entry['path']) as stream:
+                info = os.fstat(stream.fileno())
+                if info.st_size != entry['size']:
+                    raise ValueError('Payload length differs')
+                entry['mtime_ns'] = info.st_mtime_ns
         elif mode == 'producer-digest':
             entry['blake3'] = hexdigest(source.get('blake3'))
         entries.append(entry)
@@ -180,9 +186,11 @@ def register(spec, mode, root=None, *, seed=None):
     receipt = {'operation': 'registration', 'mode': mode, 'payload_bytes_read': count,
                'payload_bytes_declared': sum(item['size'] for item in entries),
                'payload_members': len(entries), 'metadata_members': len(spec['metadata']),
+               'size_mtime_checks': len(entries) if mode == 'size-mtime' else 0,
                'fresh_full_payload_check': mode == 'full',
                'identity_basis': ('full-digests' if mode in ('full', 'producer-digest')
                                   else 'sampled-fingerprints' if mode in ('header-footer', 'random-blocks')
+                                  else 'size-and-mtime' if mode == 'size-mtime'
                                   else 'publisher-asserted-revision'),
                'retention_verified': False, 'release_id': document_id(value)}
     return value, receipt
@@ -212,6 +220,10 @@ def validate_release(value, expected_id):
             hexdigest(entry.get('fingerprint_blake3'))
             if entry.get('ranges') != ranges(entry['size'], mode, value.get('seed', '') + ':' + entry['path']):
                 raise ValueError('Invalid sample ranges')
+        if mode == 'size-mtime':
+            fields.add('mtime_ns')
+            if type(entry.get('mtime_ns')) is not int:
+                raise ValueError('Invalid nanosecond modification time')
         if set(entry) != fields:
             raise ValueError('Invalid payload evidence')
         spec['payloads'].append({key: entry[key] for key in ('path', 'size')})
@@ -243,20 +255,25 @@ def bind(value, binding, expected_id, *, verification):
             raise ValueError('Binding names another revision')
     text(binding['retention_assertion'])
     mode = value['mode']
-    if verification not in ('full', 'fingerprint', 'reference-only'):
-        raise ValueError('Select full, fingerprint, or reference-only verification')
+    if verification not in ('full', 'fingerprint', 'reference-only', 'size-mtime'):
+        raise ValueError('Select full, fingerprint, reference-only, or size-mtime verification')
     if verification == 'full' and mode not in ('full', 'producer-digest'):
         raise ValueError('Full verification requires trusted expected full digests')
     if verification == 'fingerprint' and mode not in ('header-footer', 'random-blocks'):
         raise ValueError('No recorded fingerprint evidence')
+    if verification == 'size-mtime' and mode != 'size-mtime':
+        raise ValueError('Size-and-mtime verification requires recorded timestamps')
     root = Path(binding['root']).resolve(strict=True)
     count = 0
     paths = {}
     for entry in value['payloads']:
         with open_member(root, entry['path']) as stream:
-            if os.fstat(stream.fileno()).st_size != entry['size']:
+            info = os.fstat(stream.fileno())
+            if info.st_size != entry['size']:
                 raise ValueError('Payload length differs')
-            if verification != 'reference-only':
+            if verification == 'size-mtime' and info.st_mtime_ns != entry['mtime_ns']:
+                raise ValueError('Payload modification time differs')
+            if verification in ('full', 'fingerprint'):
                 selected = ranges(entry['size'], 'full', '') if verification == 'full' else entry['ranges']
                 actual, n = read_fingerprint(stream, selected, entry['size'],
                                              'full' if verification == 'full' else mode)
@@ -267,6 +284,7 @@ def bind(value, binding, expected_id, *, verification):
         paths[entry['path']] = str(root / entry['path'])
     return {'release_id': expected_id, 'operation': 'binding', 'verification': verification,
             'payload_bytes_read': count, 'payload_paths': paths,
+            'size_mtime_checks': len(paths) if verification == 'size-mtime' else 0,
             'fresh_full_payload_check': verification == 'full',
             'retention_assertion': binding['retention_assertion'], 'retention_verified': False,
             'warning': 'A path and revision assertion do not enforce immutability or retention.'}
@@ -307,7 +325,7 @@ def main(argv=None):
     check.add_argument('release')
     check.add_argument('binding')
     check.add_argument('--release-id', required=True)
-    check.add_argument('--verification', choices=('full', 'fingerprint', 'reference-only'), required=True)
+    check.add_argument('--verification', choices=('full', 'fingerprint', 'reference-only', 'size-mtime'), required=True)
     revision = commands.add_parser('revise-metadata')
     revision.add_argument('release')
     revision.add_argument('--release-id', required=True)

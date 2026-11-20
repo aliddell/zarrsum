@@ -20,6 +20,7 @@ The tool does not search for undeclared files.
 | `producer-revision` | No payload access. | Trust the producer's scoped revision and membership. The producer must not change that revision. |
 | `header-footer` | Read up to 64 KiB at each end of each file. | Fixed fingerprint. Changes outside these ranges are missed. |
 | `random-blocks` | Read up to eight distinct 64 KiB blocks per file. | Sampled fingerprint. Record the seed and exact ranges. Unsampled changes are missed. |
+| `size-mtime` | Open each file and record its length and nanosecond mtime. Read no payload bytes. | File attribute evidence. Same-length edits with preserved mtime are missed. |
 
 The release ID is a SHA-256 digest of the document. It identifies the complete
 assertions and metadata. It is not a digest of all dataset bytes. Full payload digests
@@ -97,6 +98,30 @@ The current binding accepts filesystem roots. The existing Hermes-compatible loc
 resolver remains separate. A Bruno snapshot must be accessible on the job host before
 this interface can use it. A URI alone does not transfer the snapshot to Reef.
 
+## Check file length and modification time
+
+`--mode size-mtime --root /path/to/source` records `mtime_ns` from each open file.
+Declared lengths must match. This mode performs file opens and stats, with zero payload
+bytes read. A source is required. It does not accept or invent a timestamp baseline
+from an older document that lacks one.
+
+```sh
+python -m zarrsum.revision_refs register descriptor.json \
+  --mode size-mtime --root /path/to/source --output inventory.release.json
+python -m zarrsum.revision_refs bind inventory.release.json inventory.binding.json \
+  --release-id PINNED_ID --verification size-mtime
+```
+
+Create the binding for this new release ID using the binding format above.
+The comparison uses exact nanosecond mtime. There is no tolerance window. A replica
+whose copy process changed mtime can fail this check despite having identical bytes.
+An edit that preserves length and restores mtime can pass despite changed bytes.
+The receipt reports zero payload bytes read and the number of size/mtime checks.
+It never calls this full-content verification. Metadata revisions inherit these stamps.
+
+`reference-only` remains available as an explicit weaker selection. `full` requires
+recorded full digests. It cannot certify a size-and-mtime release that has no digests.
+
 ## Create metadata B
 
 Save the complete new metadata map as `B.metadata.json`:
@@ -134,7 +159,7 @@ larger local files for full hashing. It does not add large-object transfer suppo
 A first full transfer still moves every required byte. A loader still reads the data it
 consumes. Registration measurements must not be reported as transfer or training rates.
 
-`examples/compare_revision_strategies.py` compares six modes on eight dense 128 MiB files.
+`examples/compare_revision_strategies.py` compares seven modes on eight dense 128 MiB files.
 It records bytes read, registration time, binding time, and metadata-update time.
 It also tests a known unsampled edit and a sampled edit. Repeated reads have uncontrolled
 cache state. The descriptor-only 2 PB case creates no payload files. It measures manifest

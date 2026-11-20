@@ -29,7 +29,7 @@ def binding(root, value):
 def test_all_modes_have_explicit_receipts_and_roundtrip(fixture, mode):
     root, spec = fixture
     value, receipt = refs.register(spec, mode, root, seed='test-seed')
-    policy = 'full' if mode in ('full', 'producer-digest') else 'fingerprint' if mode in ('header-footer', 'random-blocks') else 'reference-only'
+    policy = 'full' if mode in ('full', 'producer-digest') else 'fingerprint' if mode in ('header-footer', 'random-blocks') else 'size-mtime' if mode == 'size-mtime' else 'reference-only'
     result = refs.bind(value, binding(root, value), refs.document_id(value), verification=policy)
     assert result['fresh_full_payload_check'] == (policy == 'full')
     assert not result['retention_verified']
@@ -95,7 +95,7 @@ def test_sampled_block_corruption_is_detected(fixture):
         refs.bind(value, binding(root, value), refs.document_id(value), verification='fingerprint')
 
 
-@pytest.mark.parametrize('mode', ('header-footer', 'random-blocks', 'producer-revision', 'immutable-reference'))
+@pytest.mark.parametrize('mode', ('header-footer', 'random-blocks', 'producer-revision', 'immutable-reference', 'size-mtime'))
 def test_weaker_modes_cannot_claim_full_verification(fixture, mode):
     root, spec = fixture
     value, _ = refs.register(spec, mode, root)
@@ -213,3 +213,110 @@ def test_metadata_change_cannot_reuse_release_revision(fixture):
     value, _ = refs.register(spec, 'producer-revision')
     with pytest.raises(ValueError, match='new revision'):
         refs.revise_metadata(value, refs.document_id(value), 'A', {'zarr.json': 'changed'})
+
+
+def test_size_and_mtime_check_reads_no_payload(fixture, monkeypatch):
+    from contextlib import contextmanager
+
+    root, spec = fixture
+    original_open = refs.open_member
+
+    class StatOnly:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def fileno(self):
+            return self.stream.fileno()
+
+        def read(self, *args):
+            raise AssertionError('A stat check must not read payload bytes')
+
+    @contextmanager
+    def stat_only(*args):
+        with original_open(*args) as stream:
+            yield StatOnly(stream)
+
+    monkeypatch.setattr(refs, 'open_member', stat_only)
+    value, receipt = refs.register(spec, 'size-mtime', root)
+    checked = refs.bind(value, binding(root, value), refs.document_id(value), verification='size-mtime')
+    assert value['payloads'][0]['mtime_ns'] == (root / 'payload').stat().st_mtime_ns
+    assert receipt['payload_bytes_read'] == checked['payload_bytes_read'] == 0
+    assert receipt['size_mtime_checks'] == checked['size_mtime_checks'] == 1
+    assert receipt['identity_basis'] == 'size-and-mtime'
+    assert not checked['fresh_full_payload_check']
+
+
+def test_size_mtime_detects_timestamp_change_but_misses_restored_stamp(fixture):
+    import os
+
+    root, spec = fixture
+    value, _ = refs.register(spec, 'size-mtime', root)
+    path = root / 'payload'
+    before = path.stat()
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+    with pytest.raises(ValueError, match='modification time differs'):
+        refs.bind(value, binding(root, value), refs.document_id(value), verification='size-mtime')
+    with path.open('r+b') as stream:
+        stream.seek(1000)
+        stream.write(b'changed')
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    result = refs.bind(value, binding(root, value), refs.document_id(value), verification='size-mtime')
+    assert result['payload_bytes_read'] == 0 and not result['fresh_full_payload_check']
+
+
+def test_size_mtime_refuses_wrong_length(fixture):
+    root, spec = fixture
+    value, _ = refs.register(spec, 'size-mtime', root)
+    (root / 'payload').write_bytes(b'short')
+    with pytest.raises(ValueError, match='length differs'):
+        refs.bind(value, binding(root, value), refs.document_id(value), verification='size-mtime')
+    with pytest.raises(ValueError, match='length differs'):
+        refs.register(spec, 'size-mtime', root)
+
+
+@pytest.mark.parametrize('mode', ('full', 'producer-digest', 'producer-revision', 'immutable-reference', 'header-footer', 'random-blocks'))
+def test_size_mtime_does_not_invent_baseline_for_old_modes(fixture, mode):
+    root, spec = fixture
+    value, _ = refs.register(spec, mode, root)
+    with pytest.raises(ValueError, match='requires recorded timestamps'):
+        refs.bind(value, binding(root, value), refs.document_id(value), verification='size-mtime')
+
+
+def test_size_mtime_timestamp_must_be_integer(fixture):
+    root, spec = fixture
+    value, _ = refs.register(spec, 'size-mtime', root)
+    value['payloads'][0]['mtime_ns'] = True
+    with pytest.raises(ValueError, match='nanosecond modification time'):
+        refs.validate_release(value, refs.document_id(value))
+
+
+def test_size_mtime_cli_roundtrip(fixture, capsys):
+    root, spec = fixture
+    descriptor = write_json(root / 'descriptor.json', spec)
+    output = root / 'release.json'
+    assert refs.main(['register', str(descriptor), '--mode', 'size-mtime', '--root', str(root), '--output', str(output)]) == 0
+    registered = json.loads(capsys.readouterr().out)
+    value = refs.read_json(output)
+    source = write_json(root / 'binding.json', binding(root, value))
+    assert refs.main(['bind', str(output), str(source), '--release-id', registered['release_id'], '--verification', 'size-mtime']) == 0
+    checked = json.loads(capsys.readouterr().out)
+    assert checked['payload_bytes_read'] == 0 and checked['size_mtime_checks'] == 1
+
+
+def test_permission_failure_is_explicit_refusal(fixture, monkeypatch, capsys):
+    from contextlib import contextmanager
+
+    root, spec = fixture
+    value, _ = refs.register(spec, 'producer-revision')
+    release = write_json(root / 'release.json', value)
+    source = write_json(root / 'binding.json', binding(root, value))
+
+    @contextmanager
+    def denied(*args):
+        raise PermissionError(13, 'Permission denied', str(root / 'payload'))
+        yield
+
+    monkeypatch.setattr(refs, 'open_member', denied)
+    assert refs.main(['bind', str(release), str(source), '--release-id', refs.document_id(value), '--verification', 'reference-only']) == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result['state'] == 'refused' and 'Permission denied' in result['reason']

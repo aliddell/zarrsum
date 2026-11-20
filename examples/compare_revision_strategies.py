@@ -62,7 +62,8 @@ def main():
         for mode in order:
             (value, receipt), seconds = timed(lambda: refs.register(spec, mode, payloads, seed='trial-seed'))
             policy = ('full' if mode in ('full', 'producer-digest') else
-                      'fingerprint' if mode in ('header-footer', 'random-blocks') else 'reference-only')
+                      'fingerprint' if mode in ('header-footer', 'random-blocks') else
+                      'size-mtime' if mode == 'size-mtime' else 'reference-only')
             checked, check_seconds = timed(lambda: refs.bind(value, location(payloads, value), refs.document_id(value), verification=policy))
             (updated, update_receipt), update_seconds = timed(lambda: refs.revise_metadata(
                 value, refs.document_id(value), 'B', {'zarr.json': '{"label":"B"}'}))
@@ -92,13 +93,15 @@ def main():
     sampled = retained['random-blocks']['payloads'][0]['ranges']
     sampled_indices = {offset // refs.BLOCK for offset, _ in sampled}
     index = next(i for i in range(1, (128 << 20) // refs.BLOCK - 1) if i not in sampled_indices)
+    original_stamp = (payloads / 'payload-00').stat()
     with (payloads / 'payload-00').open('r+b') as stream:
         stream.seek(index * refs.BLOCK)
         stream.write(b'known middle corruption')
+    os.utime(payloads / 'payload-00', ns=(original_stamp.st_atime_ns, original_stamp.st_mtime_ns))
     outcomes = {}
     for mode, policy in [('full', 'full'), ('producer-digest', 'full'), ('header-footer', 'fingerprint'),
                          ('random-blocks', 'fingerprint'), ('producer-revision', 'reference-only'),
-                         ('immutable-reference', 'reference-only')]:
+                         ('immutable-reference', 'reference-only'), ('size-mtime', 'size-mtime')]:
         value = retained[mode]
         try:
             refs.bind(value, location(payloads, value), refs.document_id(value), verification=policy)
@@ -107,7 +110,8 @@ def main():
             outcomes[mode] = 'change detected'
     assert outcomes['full'] == outcomes['producer-digest'] == 'change detected'
     assert all(outcomes[m] == 'change missed under selected policy' for m in refs.MODES if m not in ('full', 'producer-digest'))
-    result['known_unsampled_change'] = {'block': index, 'outcomes': outcomes}
+    result['known_unsampled_change'] = {'block': index, 'outcomes': outcomes,
+                                      'size_and_mtime_preserved': True}
     # Also require the stored random fingerprint to detect a sampled-block change.
     value = retained['random-blocks']
     with (payloads / 'payload-00').open('r+b') as stream:
