@@ -347,7 +347,12 @@ class Boundary:
 
         client.meta.events.register("before-call.s3", count)
 
-    def receipt(self, name, value):
+    def _preflight_transport(self):
+        inspect = getattr(self.adapter, "binary_identity", None)
+        if inspect is not None:
+            inspect()
+
+    def receipt(self, name, value, *, transport_used=True):
         from . import transport
 
         sources = {
@@ -357,6 +362,9 @@ class Boundary:
         }
         if value.get("packaging", {}).get("format") == "ozx":
             sources["ozx"] = Path(__file__).with_name("ozx.py")
+        provenance = getattr(self.adapter, "provenance", None)
+        if transport_used and provenance is not None:
+            value["transport"] = provenance()
         value.update(
             utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             repository={
@@ -499,6 +507,7 @@ class Boundary:
         plan_digest=None,
     ):
         sender = Path(sender).resolve(strict=True)
+        self._preflight_transport()
         self.repository(create=True)
         root, content, records = self.timed(
             "source-metadata", lambda: graph(release_id, lambda k: local_get(sender, k))
@@ -674,6 +683,7 @@ class Boundary:
 
     def fetch(self, release_id, receiver, name="fetch"):
         receiver = Path(receiver)
+        self._preflight_transport()
         self.repository()
         workspace = Workspace()
         metadata = workspace.table(binary=True)
@@ -787,7 +797,7 @@ class Boundary:
 
     def checkout(self, receiver, release_id, destination, name="checkout"):
         result = verified_checkout(receiver, release_id, destination, timed=self.timed)
-        self.receipt(name, result)
+        self.receipt(name, result, transport_used=False)
         return result
 
 

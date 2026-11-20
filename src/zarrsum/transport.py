@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import time
@@ -29,6 +32,31 @@ class Transport(Protocol):
 
 MAX_BATCH_KEYS = 1024
 MAX_KEY_LIST_BYTES = 512 << 10
+
+
+class ExecutableError(ValueError):
+    """The selected native executable did not pass its preflight or change fence."""
+
+
+def binary_sha256(value):
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(c not in "0123456789abcdefABCDEF" for c in value)
+    ):
+        raise ValueError("expected a 64-character SHA-256 executable digest")
+    return value.lower()
+
+
+def _binary_state(value):
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+        value.st_mode,
+    )
 
 
 def file_keys(keys):
@@ -61,16 +89,67 @@ class RcloneTransport:
         checkers=8,
         timeout=3600,
         bandwidth=None,
+        expected_sha256=None,
     ):
         if not 1 <= transfers <= 64 or not 1 <= checkers <= 64:
             raise ValueError("concurrency must be between 1 and 64")
         self.binary, self.config = str(binary), str(config or os.devnull)
         self.transfers, self.checkers = transfers, checkers
         self.timeout, self.bandwidth = timeout, bandwidth
+        self.expected_sha256 = (
+            binary_sha256(expected_sha256) if expected_sha256 is not None else None
+        )
+        self._identity = self._state = self._version = None
         self.commands = []
 
+    def binary_identity(self):
+        """Hash once per operation and refuse observed executable changes before use."""
+        if self._identity is not None:
+            if _binary_state(Path(self._identity["path"]).stat()) != self._state:
+                raise ExecutableError("rclone executable changed after verification")
+            return dict(self._identity)
+        found = shutil.which(self.binary)
+        if found is None:
+            raise ExecutableError("rclone executable is missing or not executable")
+        path = Path(found).resolve(strict=True)
+        with path.open("rb") as stream:
+            before = os.fstat(stream.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise ExecutableError("rclone executable must be a regular file")
+            digest = hashlib.sha256()
+            while block := stream.read(1 << 20):
+                digest.update(block)
+            after = os.fstat(stream.fileno())
+        if _binary_state(before) != _binary_state(after) or _binary_state(
+            after
+        ) != _binary_state(path.stat()):
+            raise ExecutableError("rclone executable changed during verification")
+        actual = digest.hexdigest()
+        if self.expected_sha256 is not None and actual != self.expected_sha256:
+            raise ExecutableError("rclone executable SHA-256 mismatch")
+        self._state = _binary_state(after)
+        self._identity = dict(
+            path=str(path),
+            requested=self.binary,
+            sha256=actual,
+            expected_sha256=self.expected_sha256,
+            pin_verified=self.expected_sha256 is not None,
+        )
+        return dict(self._identity)
+
+    def provenance(self):
+        self.binary_identity()
+        if self._version is None:
+            self.version()
+        return {
+            "backend": "direct-rclone",
+            "binary": self.binary_identity(),
+            "version": self._version,
+        }
+
     def _run(self, arguments):
-        command = [self.binary, "--config", self.config, *arguments]
+        identity = self.binary_identity()
+        command = [identity["path"], "--config", self.config, *arguments]
         self.commands.append(command)
         environment = {
             name: value
@@ -109,7 +188,11 @@ class RcloneTransport:
         status, output, _ = self._run(["version"])
         if status:
             raise ValueError("rclone version failed")
-        return output.decode().splitlines()[0]
+        lines = output.decode().splitlines()
+        if not lines:
+            raise ValueError("rclone version returned no output")
+        self._version = lines[0]
+        return self._version
 
     def copy(self, source, destination, keys):
         keys = file_keys(keys)

@@ -8,6 +8,7 @@ import signal
 from pathlib import Path
 
 from .locations import MAX_FETCH_BYTES, prepare, read_json
+from .transport import binary_sha256
 
 
 def main(argv=None):
@@ -22,6 +23,7 @@ def main(argv=None):
     parser.add_argument("--remotes")
     parser.add_argument("--location-remotes")
     parser.add_argument("--rclone-binary", default="rclone")
+    parser.add_argument("--rclone-sha256", type=binary_sha256)
     parser.add_argument("--transfer-timeout", type=float, default=3600)
     parser.add_argument("--max-fetch-bytes", type=int, default=MAX_FETCH_BYTES)
     parser.add_argument("--transfer-batch-size", type=int, default=64)
@@ -52,6 +54,7 @@ def main(argv=None):
             location_remotes=args.location_remotes,
             max_fetch_bytes=args.max_fetch_bytes,
             binary=args.rclone_binary,
+            expected_sha256=args.rclone_sha256,
             timeout=args.transfer_timeout,
             transfer_batch_size=args.transfer_batch_size,
         )

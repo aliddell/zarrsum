@@ -277,6 +277,7 @@ def test_pull_ozx_from_loopback_s3(tmp_path, release, local_s3):
     args = [
         "pull",
         "--ozx",
+        "--rclone-binary", "must-not-execute-for-sdk-output",
         release_id,
         str(output),
         "--remote",
@@ -290,6 +291,7 @@ def test_pull_ozx_from_loopback_s3(tmp_path, release, local_s3):
     assert_archive(output, members)
     receipt = json.loads((evidence / "pull-ozx.receipt.json").read_bytes())
     assert receipt["release_id"] == release_id
+    assert "transport" not in receipt
     assert receipt["files"] == len(members)
     assert receipt["downloaded_objects"] == len(set(members.values()))
     assert receipt["archive_blake3"] == digest(output.read_bytes())

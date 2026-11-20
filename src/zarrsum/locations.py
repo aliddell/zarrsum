@@ -20,6 +20,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 from .releases import Store, atomic_file, canonical, digest, identifier, member
 from .graph_index import Workspace
+from .transport import ExecutableError
 from .remotes import (
     Aliases,
     Boundary,
@@ -291,6 +292,8 @@ def _s3_fetch(value, rid, cache, evidence, remotes, location_remotes, limit, opt
                 "transfer_batch_size": batch_size}
     except CacheError:
         raise
+    except ExecutableError as error:
+        raise CandidateError(str(error)) from error
     except (BotoCoreError, ClientError, ValueError) as error:
         raise CandidateError("S3 store could not supply verified content") from error
     finally:

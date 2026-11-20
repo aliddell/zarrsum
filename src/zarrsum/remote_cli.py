@@ -13,15 +13,20 @@ import time
 
 from .releases import atomic_file, canonical, identifier
 from .remotes import Aliases, Boundary, REPOSITORY, remote_config, verified_checkout
-from .transport import RcloneTransport
+from .transport import RcloneTransport, binary_sha256
 
 
-def connection(config, override=None, binary="rclone", bandwidth=None, timeout=3600):
+def connection(config, override=None, binary="rclone", bandwidth=None, timeout=3600,
+               expected_sha256=None, *, preflight_native=True):
     import boto3
     from botocore.config import Config
 
     config = remote_config(config)
     path = str(override or config["rclone_config"])
+    transport = RcloneTransport(binary=binary, config=path, bandwidth=bandwidth,
+                                timeout=timeout, expected_sha256=expected_sha256)
+    if preflight_native:
+        transport.binary_identity()
     parsed = configparser.ConfigParser(interpolation=None)
     if not parsed.read(path) or config["rclone_remote"] not in parsed:
         raise ValueError("rclone configuration or remote is missing")
@@ -60,9 +65,6 @@ def connection(config, override=None, binary="rclone", bandwidth=None, timeout=3
         or remote.get("session_token", "") != (credentials.token or "")
     ):
         raise ValueError("SDK profile and rclone credentials do not match")
-    transport = RcloneTransport(
-        binary=binary, config=path, bandwidth=bandwidth, timeout=timeout
-    )
     return client, transport, path
 
 
@@ -132,6 +134,7 @@ def main(argv=None):
             item.add_argument("--remote", required=True)
             item.add_argument("--remotes", required=True)
             item.add_argument("--rclone-binary", default="rclone")
+            item.add_argument("--rclone-sha256", type=binary_sha256)
             item.add_argument("--rclone-config")
             item.add_argument("--bwlimit")
             item.add_argument("--transfer-timeout", type=timeout_seconds, default=3600)
@@ -145,6 +148,8 @@ def main(argv=None):
         args = parser.parse_args(supplied)
     direct_ozx = args.command == "pull" and args.ozx
     if args.command == "pull":
+        if direct_ozx and args.rclone_sha256 is not None:
+            parser.error("--rclone-sha256 applies only to native directory transfers")
         if direct_ozx and args.store is not None:
             parser.error("pull --ozx takes RELEASE_ID DESTINATION without STORE")
         if not direct_ozx and args.store is None:
@@ -218,6 +223,8 @@ def main(argv=None):
                     args.rclone_binary,
                     args.bwlimit,
                     args.transfer_timeout,
+                    expected_sha256=args.rclone_sha256,
+                    preflight_native=not direct_ozx,
                 )
                 boundary = Boundary(
                     client,
@@ -244,7 +251,7 @@ def main(argv=None):
                             workers=args.workers or 4,
                         ),
                     )
-                    boundary.receipt("pull-ozx", output)
+                    boundary.receipt("pull-ozx", output, transport_used=False)
                 elif args.command == "push":
                     output = boundary.push(
                         args.store,
@@ -266,6 +273,7 @@ def main(argv=None):
                 if not direct_ozx:
                     output["transport_version"] = version
                     output["transfer_batch_size"] = args.transfer_batch_size
+                    output["transport"] = transport.provenance()
         print(json.dumps(output, sort_keys=True))
         return 0
     except KeyboardInterrupt as error:

@@ -314,3 +314,30 @@ and prepares separate metadata with hard-linked payloads. See [REFERENCE-WORKFLO
 The catalog client and remote extra are required. Tests use an owned HTTP catalog
 fixture. Filesystem preparation requires a mounted candidate on the checkout filesystem.
 It does not add S3 payload recovery or managed Hermes submission to this reference format.
+
+## Pin the native transfer executable
+
+Use an explicit executable and an approved SHA-256 for reproducible native transfers:
+
+```bash
+zarrsum-release pull "$CACHE" "$RELEASE" "$CHECKOUT" \
+  --remote test --remotes remotes.json --evidence evidence/pull \
+  --rclone-binary "$TOOLS/rclone" --rclone-sha256 "$EXPECTED_RCLONE_SHA256"
+```
+
+The same flags apply to `push`, `fetch`, and `prepare`. Obtain the expected digest
+from the approved tool package or deployment record. A mismatch refuses native
+execution before SDK credential lookup or copying. The executable is resolved to
+one absolute path and hashed once per operation. Later native calls refuse observed
+changes to its device, inode, length, mode, or timestamps.
+
+Native transfer receipts contain `transport.version` and `transport.binary`, including
+`path`, `requested`, `sha256`, `expected_sha256`, and `pin_verified`. Preparation saves
+the same record under `fetch.transport`. Existing `transport_version` output remains.
+Without `--rclone-sha256`, the command records the observed digest and sets
+`pin_verified` to false. The default remains compatible with existing invocations.
+
+A complete-cache preparation does not load or execute rclone. Its empty fetch record
+does not claim a checked native pin. Offline checkout also needs no executable.
+`pull --ozx` uses the SDK only and refuses `--rclone-sha256`; its receipt does not
+claim rclone provenance. Binary checks do not change release IDs or byte verification.

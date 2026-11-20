@@ -157,3 +157,13 @@ plan identity, cache admission, and fresh byte checks remain unchanged.
 
 Portable Reef references use the projects-relative form only. Job-local cache,
 checkout, and evidence paths remain ordinary local configuration.
+
+## Pin the S3 transfer executable
+
+`prepare --rclone-binary /approved/tools/rclone --rclone-sha256 EXPECTED_SHA256`
+checks the approved native executable before an S3 transfer. Python callers pass
+`binary="/approved/tools/rclone", expected_sha256=approved_digest` to `prepare`.
+The successful S3 fetch record includes the resolved path, actual digest, expected
+digest, pin result, and version under `fetch.transport`. A rejected executable
+publishes no checkout or success receipt. Candidate evidence preserves the reason.
+A verified complete cache remains usable without rclone or access credentials.
