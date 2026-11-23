@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 from .transport import RcloneTransport, TransferResult, file_keys
 
@@ -58,10 +59,12 @@ def stop_group(process):
 class HermesTransport(RcloneTransport):
     max_batch_keys = MAX_BATCH_KEYS
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, cancelled=lambda: False, **kwargs):
+        self.cancelled = cancelled
         super().__init__(*args, **kwargs)
         self.hermes = hermes_identity()
         self.child_pids = []
+        self.worker_pids = []
 
     def provenance(self):
         value = super().provenance()
@@ -124,8 +127,19 @@ class HermesTransport(RcloneTransport):
                     env=environment,
                     start_new_session=True,
                 )
+                self.worker_pids.append(process.pid)
                 try:
-                    process.wait(timeout=self.timeout)
+                    deadline = time.monotonic() + self.timeout
+                    while process.poll() is None:
+                        if self.cancelled():
+                            raise InterruptedError("Managed transfer cancelled or fenced")
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise subprocess.TimeoutExpired(process.args, self.timeout)
+                        try:
+                            process.wait(timeout=min(0.1, remaining))
+                        except subprocess.TimeoutExpired:
+                            pass
                     if process.returncode:
                         stop_group(process)
                 except BaseException:

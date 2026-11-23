@@ -65,3 +65,40 @@ identity, access, and cancellation. Existing strong verification remains enabled
 experiment for durable intent, exact job reconciliation, cancellation fences, and
 bound worker receipts. Its tests use a fake service and local fixture bytes. It has
 no deployed Hermes client and does not enable a managed transport in `Boundary`.
+
+## Real local control-plane acceptance candidate
+
+The candidate `hermes_jobs` module connects the proposed contract to gated routes in
+the real Hermes application. It supplies an injected HTTP client and a local executor
+callback for the real runner. The test uses the real JobStore with mocked DynamoDB,
+the retained exact-file adapter, native rclone, private MinIO, and existing release
+admission. It does not configure or upgrade a deployed managed service.
+
+`ExactServiceClient` uses deterministic intent lookup and owner-scoped job reads.
+It can recover a lost submission response and a completely new client after restart.
+`ExactExecutor` checks the actual worker and executable hashes. It observes cancellation
+and the current execution fence, stops the native group, and records the real receipt.
+
+`ManagedHermesTransport` is selected explicitly through Python `Boundary(transport=...)`.
+It needs the selected release ID, its validated graph entries, native pin, service client,
+and an owned record directory. It fetches payload batches into separate private paths.
+It requires the bound stopped-worker receipt and checks each required BLAKE3 digest
+before it returns bytes to the existing Boundary admission path. Boundary then performs
+its own full check and publishes the cache release root. Transfer success alone does
+not prove release identity.
+
+The controller accepts a configured rclone source root for this experiment. The API's
+deployment policy must authorize its mapping. The worker receives its private rclone
+configuration from the application, not from an API request. Only local destination
+paths are supported in this candidate. The default batch remains bounded to 256 keys.
+
+If stop acknowledgement is unavailable, the transport retains the original private
+staging path and writes `quarantine.json`. It does not copy uncertain output elsewhere
+and then remove a path that an executor can still write. An uncertain submission or
+an existing batch record can require manual reconciliation. The bridge does not yet
+provide a restartable production CLI or automatic recovery for every timeout.
+
+The receipts describe stopped native transfer groups. They do not claim that a SLURM
+job or Kubernetes pod has terminated. The local acceptance uses ASGI HTTP requests and
+injected proxy identity headers. It does not test a network proxy or deployed SSO.
+See the matching Hermes candidate's `EXACT-FILES.md` for the API and runner contract.

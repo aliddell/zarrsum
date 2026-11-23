@@ -33,11 +33,15 @@ def exact_request(value):
     keys = file_keys(value["keys"])
     if not keys or len(keys) > 256 or list(keys) != value["keys"]:
         raise ContractMismatch("Expected 1 to 256 exact file keys")
+    source_name = value["source"]
+    configured_source = (isinstance(source_name, str)
+                         and re.fullmatch(r"[A-Za-z0-9_-]+:[^\n\r\x00]+", source_name)
+                         and "://" not in source_name)
     source, parent = (Path(value[name]) for name in ("source", "staging_parent"))
-    for path in (source, parent):
+    for path in ((parent,) if configured_source else (source, parent)):
         if not path.is_absolute() or str(path.resolve()) != str(path):
             raise ContractMismatch("The local contract requires canonical absolute roots")
-    if source.is_relative_to(parent) or parent.is_relative_to(source):
+    if not configured_source and (source.is_relative_to(parent) or parent.is_relative_to(source)):
         raise ContractMismatch("Source and private staging roots must be separate")
     if len(encoded(value)) > 1 << 20:
         raise ContractMismatch("Managed request exceeds the document bound")
@@ -153,6 +157,8 @@ class ManagedTransfer:
                 raise ContractMismatch("Worker receipt does not bind the selected request")
             if not receipt.get("execution_id"):
                 raise ContractMismatch("Worker execution identity is missing")
+            if job.get("execution_id") is not None and receipt["execution_id"] != job["execution_id"]:
+                raise ContractMismatch("Worker receipt belongs to another execution")
             if state["cancel_requested"] or job.get("status") != "SUCCEEDED":
                 state["phase"] = "stopped-without-acceptance"
                 self._save(state)
